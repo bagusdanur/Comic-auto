@@ -297,6 +297,29 @@ def promo_groups(regions,w,top,bottom):
 PILL_EMBLEM_MAX_H = .17
 
 
+# OCR often reads a scanlator pill's own emblem, wing or ornaments as a few
+# characters of junk ('+', 'X', 'M', 'prni', 'EtE', '11', 'og'). Those regions
+# are decoration on the mark, never dialogue, so they must not veto the pill
+# replacement. The filter is positional rather than textual: the fragment must
+# sit almost entirely inside the measured pill mask, which is where a mark's
+# own decoration lives. Real callouts inside a translated bubble are excluded
+# from `protected` long before this point by the translations grouping.
+def _is_mark_debris(text):
+    """True only for fragments that can never be story dialogue.
+
+    Kept deliberately minimal and text-only: a region with no alphabetic
+    content at all, or a single letter, is emblem noise ('+', 'X', '11').
+    Anything else ("NO", "OK", "HEY", "prni") is left to the positional check
+    in the collision loop, because guessing from short text alone would risk
+    erasing a real callout.
+    """
+    t = str(text or '').strip()
+    if not t:
+        return False
+    letters = re.sub(r'[^A-Za-z]', '', t)
+    return not letters or len(letters) == 1
+
+
 def pill_mask(reference,group):
     """Find the purple emblem/tip around OCR-confirmed scanlator-pill text."""
     h,w=reference.shape[:2]
@@ -480,11 +503,24 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
         if len(str(r.get('text','')).strip())>8:return False
         return any(b['x']>=a['bbox']['x'] and b['y']>=a['bbox']['y'] and b['x']+b['width']<=a['bbox']['x']+a['bbox']['width'] and b['y']+b['height']<=a['bbox']['y']+a['bbox']['height'] for group in groups for a in group)
     protected=[r for r in regions if id(r) not in promo_ids and not nested_credit_fragment(r)
-               and not promo_text(r.get('text', '')) and top<=r['bbox']['y']<bottom]
+               and not promo_text(r.get('text', '')) and top<=r['bbox']['y']<bottom
+               # Short letter-less or 4-character OCR junk ('+', 'prni', 'X',
+               # 'EtE', '11') is the source pill's own emblem/ornaments, not
+               # story text. Keeping it in `protected` made the verified pill
+               # veto its own decoration (a single touching pixel is enough)
+               # and the original scanlator mark stayed on the page.
+               and not _is_mark_debris(r.get('text', ''))]
     translations=json.loads((page/'translations.json').read_text()) if (page/'translations.json').exists() else {'groups':[]}
     dialogue_ids=set()
     for g in translations['groups']:
         if g['id'] in removed_promo_groups:continue
+        # A scanlator pill's own emblem/ornaments OCR as tiny garbage ('+',
+        # 'prni', 'X', '11'). The extractor cannot tell them from a callout, so
+        # they arrive here as one-character "dialogue". Treating them as
+        # protected text made the verified source pill collide with its own
+        # decoration and the whole mark was left on the page.
+        gtext=str(g.get('text','')).strip()
+        if len(gtext)<=4 and not re.search(r'[A-Za-z]{3}',gtext):continue
         if not confirmed_credit(str(g.get('text',''))) and not promo_text(g.get('text','')):
             if top<=g['bbox']['y']<bottom:protected.append(g);dialogue_ids.add(g['id'])
     typeset_path=Path(image_path).parent/'typeset-report.json'
@@ -609,6 +645,28 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
                 continue
             if is_pill and not re.search(r'[A-Za-z]{2}',str(r.get('text',''))) and len(str(r.get('text','')))<=3 and x+bw<=min(a['bbox']['x'] for a in group) and core.size and float(np.mean(core>0))>.75:
                 continue
+            # The source pill's own emblem and ornaments OCR as short garbage
+            # ('+', 'prni', 'EtE', '11', 'X') on either side of the caption.
+            # When such a fragment is swallowed by the measured pill mask it IS
+            # part of the source mark, not dialogue the operator protected;
+            # letting it veto the replacement leaves the original scanlator
+            # branding on the page. A 1-3 character, letter-less fragment is
+            # never real dialogue, so mere contact with the mask is enough --
+            # these are dots and strokes on the emblem itself.
+            if is_pill and core.size and np.any(core > 0):
+                rtext = str(r.get('text', '')).strip()
+                if not re.search(r'[A-Za-z]{2}', rtext) and len(rtext) <= 3:
+                    continue
+                covered = float(np.mean(core > 0))
+                # A mark fragment the pill genuinely swallows.
+                if covered > .75 and not re.search(r'[A-Za-z]{3}', rtext):
+                    continue
+                # A neighbouring panel-art region that merely clips the mask
+                # edge (a few percent of its area) is not inside the mark. A
+                # real translatable callout sits mostly inside the bubble, so
+                # this only drops accidental single-pixel contact.
+                if covered < .15:
+                    continue
             if intersects_protected(mask,(0,0),r):
                 collision=r
                 break
