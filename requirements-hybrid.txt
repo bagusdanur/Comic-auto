@@ -1,0 +1,3 @@
+# Optional hybrid artwork inpainting runtime. The existing OCR environment
+# already supplies numpy, Pillow and OpenCV.
+onnxruntime>=1.19,<2
