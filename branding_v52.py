@@ -289,6 +289,14 @@ def promo_groups(regions,w,top,bottom):
     return groups
 
 
+# Upper bound (as a fraction of page width) for the source pill emblem's height.
+# ThunderScans-style emblems measure ~0.15*w on an 800px page, so the original
+# 0.13 cutoff rejected them as "cannot locate source pill emblem" and the whole
+# mark was left untouched. 0.17 admits those emblems while staying well below a
+# typical panel height, so unrelated purple artwork is still excluded.
+PILL_EMBLEM_MAX_H = .17
+
+
 def pill_mask(reference,group):
     """Find the purple emblem/tip around OCR-confirmed scanlator-pill text."""
     h,w=reference.shape[:2]
@@ -304,7 +312,7 @@ def pill_mask(reference,group):
     icons=[]
     for label in range(1,n):
         px,py,pw,ph,area=stats[label]
-        if w*.025<=ph<=np.ceil(w*.13) and w*.02<=pw<=w*.5 and area>40 and x1+px<x and abs(y1+py+ph/2-(y+bottom)/2)<w*.045:
+        if w*.025<=ph<=np.ceil(w*PILL_EMBLEM_MAX_H) and w*.02<=pw<=w*.5 and area>40 and x1+px<x and abs(y1+py+ph/2-(y+bottom)/2)<w*.045:
             icons.append((abs(x-(x1+px+pw)),label))
     if not icons:
         # Purple artwork can connect to the emblem at low saturation. Require
@@ -315,7 +323,7 @@ def pill_mask(reference,group):
             candidates=[]
             for label in range(1,len(candidate_stats)):
                 px,py,pw,ph,area=candidate_stats[label]
-                if (w*.025<=ph<=np.ceil(w*.13) and w*.02<=pw<=w*.16 and area>100
+                if (w*.025<=ph<=np.ceil(w*PILL_EMBLEM_MAX_H) and w*.02<=pw<=w*.16 and area>100
                     and py>3 and py+ph<crop.shape[0]-3 and x1+px<x
                     and x1+px+pw<=x+8 and abs(y1+py+ph/2-(y+bottom)/2)<w*.045):
                     candidates.append((abs(x-(x1+px+pw)),label))
@@ -347,8 +355,12 @@ def pill_mask(reference,group):
     yy,xx=np.where(mask);bounds=(int(xx.min()),int(yy.min()),int(xx.max()+1),int(yy.max()+1))
     # Large genuine pills can exceed half the page. Bound their size against
     # the OCR-confirmed caption as well as the page, not a fixed 50% cutoff.
+    # The measured extent includes the 7x7 dilation and the caption's own
+    # right-hand pad, so allow for those or a correct pill is rejected by a
+    # handful of pixels ("implausibly wide").
     caption_width=right-x
-    allowed_width=max(w*.5,min(w*.65,caption_width+min(w*.20,caption_width*.65)+16))
+    edge_pad=round(w*.035)
+    allowed_width=max(w*.5,min(w*.65,caption_width+min(w*.20,caption_width*.65)+16))+edge_pad
     if bounds[2]-bounds[0]>allowed_width:raise RuntimeError('V5.2 pill extent is implausibly wide')
     return mask,bounds
 
