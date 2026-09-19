@@ -350,6 +350,140 @@ export async function buildApp(): Promise<FastifyInstance> {
     if (result.changes !== 1) return reply.code(409).send({ error: "Job is missing or can no longer be stopped" });
     return { id: jobId, status: "CANCELLED" };
   });
+  // Deleting a comic or a chapter is permanent: the row, every child row
+  // (chapters, jobs, images, regions, memory) and the whole directory tree are
+  // removed, because ON DELETE CASCADE plus a recursive rm covers the lot.
+  // Two guards mirror the per-job delete: a running job aborts the request, and
+  // the folder must resolve inside jobs/library so a bad slug can never walk
+  // out of the storage root.
+  const folderSize = async (target: string): Promise<number> => {
+    let total = 0;
+    const walk = async (current: string) => {
+      let entries;
+      try {
+        entries = await readdir(current, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const child = resolve(current, entry.name);
+        if (entry.isDirectory()) await walk(child);
+        else {
+          try {
+            total += (await stat(child)).size;
+          } catch {
+            /* vanished mid-walk */
+          }
+        }
+      }
+    };
+    await walk(target);
+    return total;
+  };
+
+  const previewChapter = (chapterId: string) => {
+    const chapter = database.prepare("SELECT * FROM chapters WHERE id=?").get(chapterId) as SqlRow | undefined;
+    if (!chapter) return null;
+    const comic = database.prepare("SELECT * FROM comics WHERE id=?").get(String(chapter.comic_id)) as SqlRow | undefined;
+    const jobs = database.prepare(
+      "SELECT id,status FROM jobs WHERE json_extract(options_json,'$.chapter_id')=? OR (json_extract(options_json,'$.comic_id')=? AND json_extract(options_json,'$.chapter')=?)"
+    ).all(chapterId, String(chapter.comic_id), String(chapter.number)) as SqlRow[];
+    return { chapter, comic, jobs };
+  };
+
+  app.get("/api/chapters/:chapterId", async (request, reply) => {
+    const found = previewChapter((request.params as { chapterId: string }).chapterId);
+    if (!found) return reply.code(404).send({ error: "Chapter not found" });
+    const { chapter, comic, jobs } = found;
+    const directory = resolve(jobsDirectory, "library", String(comic?.slug ?? ""), `chapter-${String(chapter.slug)}`);
+    return {
+      id: chapter.id, number: chapter.number, comic_title: comic?.title ?? "",
+      job_count: jobs.length, bytes: await folderSize(directory),
+      has_running_job: jobs.some((job) => String(job.status) === "PROCESSING"),
+    };
+  });
+
+  app.delete("/api/chapters/:chapterId", async (request, reply) => {
+    const chapterId = (request.params as { chapterId: string }).chapterId;
+    const found = previewChapter(chapterId);
+    if (!found) return reply.code(404).send({ error: "Chapter not found" });
+    const { chapter, comic, jobs } = found;
+    if (jobs.some((job) => String(job.status) === "PROCESSING")) {
+      return reply.code(409).send({ error: "A chapter with a processing job cannot be deleted" });
+    }
+    const comicSlug = String(comic?.slug ?? "");
+    const directory = resolve(jobsDirectory, "library", comicSlug, `chapter-${String(chapter.slug)}`);
+    const relativeDirectory = relative(jobsDirectory, directory);
+    if (!relativeDirectory || relativeDirectory.startsWith("..") || isAbsolute(relativeDirectory)) {
+      return reply.code(409).send({ error: "Chapter storage path is invalid" });
+    }
+    const bytes = await folderSize(directory);
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const job of jobs) database.prepare("DELETE FROM jobs WHERE id=?").run(String(job.id));
+      database.prepare("DELETE FROM chapters WHERE id=?").run(chapterId);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    await rm(directory, { recursive: true, force: true });
+    return { id: chapterId, status: "DELETED", jobs: jobs.length, bytes };
+  });
+
+  const previewComic = (comicId: string) => {
+    const comic = database.prepare("SELECT * FROM comics WHERE id=?").get(comicId) as SqlRow | undefined;
+    if (!comic) return null;
+    const chapters = database.prepare("SELECT id,number,slug FROM chapters WHERE comic_id=?").all(comicId) as SqlRow[];
+    const jobs = database.prepare(
+      "SELECT id,status FROM jobs WHERE json_extract(options_json,'$.comic_id')=?"
+    ).all(comicId) as SqlRow[];
+    const memories = database.prepare("SELECT count(*) c FROM memory_jobs WHERE comic_id=?").get(comicId) as SqlRow;
+    const references = database.prepare("SELECT count(*) c FROM memory_references WHERE comic_id=?").get(comicId) as SqlRow;
+    return { comic, chapters, jobs, memories: Number(memories?.c ?? 0), references: Number(references?.c ?? 0) };
+  };
+
+  app.get("/api/comics/:comicId/deletion-preview", async (request, reply) => {
+    const found = previewComic((request.params as { comicId: string }).comicId);
+    if (!found) return reply.code(404).send({ error: "Comic not found" });
+    const directory = resolve(jobsDirectory, "library", String(found.comic.slug));
+    return {
+      id: found.comic.id, title: found.comic.title,
+      chapter_count: found.chapters.length, job_count: found.jobs.length,
+      memory_jobs: found.memories, memory_references: found.references,
+      bytes: await folderSize(directory),
+      has_running_job: found.jobs.some((job) => String(job.status) === "PROCESSING"),
+    };
+  });
+
+  app.delete("/api/comics/:comicId", async (request, reply) => {
+    const comicId = (request.params as { comicId: string }).comicId;
+    const found = previewComic(comicId);
+    if (!found) return reply.code(404).send({ error: "Comic not found" });
+    const { comic, chapters, jobs } = found;
+    if (jobs.some((job) => String(job.status) === "PROCESSING")) {
+      return reply.code(409).send({ error: "A comic with a processing job cannot be deleted" });
+    }
+    const directory = resolve(jobsDirectory, "library", String(comic.slug));
+    const relativeDirectory = relative(jobsDirectory, directory);
+    if (!relativeDirectory || relativeDirectory.startsWith("..") || isAbsolute(relativeDirectory)) {
+      return reply.code(409).send({ error: "Comic storage path is invalid" });
+    }
+    const bytes = await folderSize(directory);
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const job of jobs) database.prepare("DELETE FROM jobs WHERE id=?").run(String(job.id));
+      // chapters and every memory row cascade from the comic delete
+      database.prepare("DELETE FROM comics WHERE id=?").run(comicId);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    await rm(directory, { recursive: true, force: true });
+    return { id: comicId, status: "DELETED", chapters: chapters.length, jobs: jobs.length, bytes };
+  });
+
   app.delete("/api/jobs/:jobId", async (request, reply) => {
     const { jobId } = request.params as { jobId: string };
     const row = database.prepare("SELECT status,input_path FROM jobs WHERE id=?").get(jobId) as SqlRow | undefined;
