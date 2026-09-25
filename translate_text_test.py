@@ -70,36 +70,10 @@ def merge_vertical_fragments(groups: list[dict]) -> list[dict]:
     return merged
 
 
+from promo_text import is_noise
+
+
 def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
-    def is_noise(text: str) -> bool:
-        value = text.strip().casefold()
-        compact = re.sub(r"[^a-z0-9]", "", value)
-        return (
-            not re.search(r"[a-z]", value)
-            or bool(re.search(
-                r"(?:https?://|www\.|\.org\b|\.com\b|discord|paypal\.me|"
-                r"make\s+sure\s+to\s+read|only\s+at\s+our\s+website|"
-                r"read\s+this\s+series\s+only|read\s+only\s+at|"
-                r"read\s+(?:at|on)\b|read\b.{0,24}\b(?:chapter|series)\b.{0,16}\b(?:at|on)|"
-                r"lightning[-\s]*fast\s+releases?|premium\s+quality\s+(?:thriving\s+)?community|"
-                r"discover\s+more\s+chapters?|"
-                r"chapters?\s+up\s+to\s+\d+|now\s+available\s+exclusively|"
-                r"follow\s+for|faster\s+updates?|large\s+library|"
-                r"thunder\s*scans?|oi\s*scans?|(?:please\s+)?support\s+(?:us|our)|support\s+means|"
-                r"(?:we\s+are|we're)\s+recruiting|(?:korean|japanese)\s+translators?|"
-                r"proofreaders?|quality\s+checkers?|\beditors?\s*:\s*\d|"
-                r"proofreaders?\b.{0,80}\b(?:translators?|editors?))", value
-            ))
-            or bool(re.search(
-                r"(?:reader\b.{0,36}\b(?:support|website)|more\s+amazing\s+series|"
-                r"best\s+possible\s+quality|continuing\s+to\s+publish)", value
-            ))
-            or any(token in compact for token in (
-                "evascans", "readthisseriesonly", "scanlation",
-                "makesuretoreadthisonlyatourwebsite", "enthunderscans",
-                "thunderscansteam", "qiscans", "oiscans",
-            ))
-        )
     def trustworthy_region(region: dict) -> bool:
         confidence = float(region.get("confidence", 0))
         if confidence >= 0.75:
@@ -143,7 +117,14 @@ def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
                  and not short_emotional_dialogue(region))
         # Very thin OCR strips in action-heavy raws are usually UI labels,
         # watermarks, or decorative speed text rather than translatable bubbles.
-        and not (int(region["bbox"]["height"]) <= 16 and int(region["bbox"]["width"]) >= int(region["bbox"]["height"]) * 6)
+        # Promo copy ("LIGHTNING-FAST RELEASES WITH PREMIUM QUALITY") measures
+        # the same 14 px height, and dropping it left the raw banner line on
+        # the finished page, so only short labels are rejected now.
+        and not (
+            int(region["bbox"]["height"]) <= 16
+            and int(region["bbox"]["width"]) >= int(region["bbox"]["height"]) * 6
+            and len(region["text"].split()) < 4
+        )
     ]
     # Tile overlap may report the same lettering twice with one damaged first
     # character (for example HEY!! / rEY!!). Remove those duplicates before

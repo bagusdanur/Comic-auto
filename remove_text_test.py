@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from hybrid_inpaint import create_lama
+from promo_text import is_noise
 from xianscan_client import XianScanClient, allowed_mask as xianscan_allowed_mask, payload_for_regions
 
 
@@ -903,6 +904,76 @@ def main() -> int:
         allowed_mask = cv2.bitwise_or(allowed_mask, painted_mask)
         results.append({"id": group["id"], "status": "CLEANED", "regions": details,
                         "surface_type": surface.get("surface_type") if surface else None})
+
+    # Safety net for regions the grouping filters rejected. Promo copy is
+    # deliberately kept out of every group (it is never translated), but
+    # before this pass nothing erased it either, so the raw banner line
+    # survived all the way into the finished page -- the classic "raw logo
+    # banner not deleted" report. Erase exactly what `is_noise` rejected and
+    # nothing else: that predicate only matches promotional / source-marking
+    # copy, so dialogue can never be caught here. Source marks are left alone
+    # because the branding stage owns them (pill replacement / inpainting).
+    grouped_region_ids = {
+        region_id
+        for item in translations["groups"]
+        for region_id in item.get("source_region_ids", [])
+    }
+    source_credit_re = re.compile(
+        r"(?:SCAN(?:S|LATION)?|THUNDER|MADARA|EVASCANS?|READ\s+(?:AT|ONLY)|"
+        r"YOU\s+CAN\s+READ|HTTPS?://|WWW\.|\.(?:COM|ORG|NET)\b)"
+    )
+    orphan_regions = []
+    for region in ocr.get("regions", []):
+        if region["id"] in grouped_region_ids:
+            continue
+        text = str(region.get("text", ""))
+        # Skip real junk specks; they are invisible and may sit on artwork.
+        if len(re.sub(r"[^a-z]", "", text, flags=re.I)) < 3:
+            continue
+        if not is_noise(text):
+            continue
+        # A short source mark ("QI SCANS", "QIMANGA.COM") belongs to the
+        # branding stage, which swaps it for the Ryukomik pill. Long promo
+        # copy that merely *mentions* a scan group ("...EXCLUSIVELY FROM QI
+        # SCANS.") is body text, not a mark -- it must be erased here or the
+        # raw line survives, so only short matches are deferred.
+        if len(text.split()) <= 4 and source_credit_re.search(text.upper()):
+            continue
+        orphan_regions.append(region)
+    if orphan_regions and args.strict_artwork_inpaint:
+        if xianscan is None:
+            raise RuntimeError("V5 orphan promo cleanup requires the inpainting service")
+        orphan_masks = []
+        for region in orphan_regions:
+            box = region["bbox"]
+            x, y, w, h = (int(box[key]) for key in ("x", "y", "width", "height"))
+            pad = max(4, min(9, round(h * 0.16)))
+            one = np.zeros(original.shape[:2], dtype=np.uint8)
+            one[max(0, y - pad):min(original.shape[0], y + h + pad),
+                max(0, x - pad):min(original.shape[1], x + w + pad)] = 255
+            orphan_masks.append(one)
+        orphan_changed = 0
+        for permitted in orphan_masks:
+            if float(np.mean(permitted > 0)) > 0.18:
+                continue
+            candidate = xianscan.inpaint_mask(output, permitted)
+            delta = np.any(candidate != output, axis=2)
+            if np.any(delta & (permitted == 0)):
+                raise RuntimeError("V5 orphan promo cleanup changed pixels outside its mask")
+            output = candidate
+            orphan_changed += int(np.count_nonzero(delta))
+            allowed_mask |= np.where(delta, 255, 0).astype(np.uint8)
+        if orphan_changed:
+            results.append({
+                "id": "orphan-promo-cleanup",
+                "status": "INPAINTED",
+                "surface_type": None,
+                "removal_backend": "v5-orphan-promo-source-footprint",
+                "inpaint_batches": len(orphan_masks),
+                "changed_pixels": orphan_changed,
+                "outside_mask_changed_pixels": 0,
+                "source_texts": [str(r.get("text", ""))[:80] for r in orphan_regions],
+            })
 
     changed = np.any(output != original, axis=2)
     outside_changes = int(np.count_nonzero(changed & (allowed_mask == 0)))

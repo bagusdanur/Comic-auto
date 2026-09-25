@@ -22,7 +22,12 @@ import psutil
 from paddleocr import PaddleOCR
 from PIL import Image, ImageDraw, ImageOps
 
-TILE_HEIGHT = int(os.getenv("TRANSLATOR_TILE_HEIGHT", "2000"))
+# 1600 instead of 2000: PaddleOCR's text detector merges adjacent lines into
+# one box once a tile gets tall, so a mixed Korean/English balloon collapsed
+# into a single unreadable box ('y ') and was then dropped by the filters --
+# leaving the raw source untouched under the translation. At <=1600 the same
+# balloon resolves into one box per line and every line is cleaned.
+TILE_HEIGHT = int(os.getenv("TRANSLATOR_TILE_HEIGHT", "1600"))
 TILE_OVERLAP = int(os.getenv("TRANSLATOR_TILE_OVERLAP", "200"))
 MIN_FREE_RAM_MB = int(os.getenv("TRANSLATOR_MIN_FREE_RAM_MB", "2000"))
 CRITICAL_FREE_RAM_MB = int(os.getenv("TRANSLATOR_CRITICAL_FREE_RAM_MB", "512"))
@@ -141,7 +146,13 @@ def main() -> int:
 
     ocr = PaddleOCR(
         text_detection_model_name="PP-OCRv5_mobile_det",
-        text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+        # en_PP-OCRv5_mobile_rec can only read Latin, and this raw is a Korean
+        # manhwa with the English overlay drawn on top of the hangul. The
+        # English-only head hallucinated Latin fragments from the mixed line
+        # ('y ' for "WHY DID SHE STOP MID-SENTENCE?"), that region then failed
+        # the >=3-letter filter and was never cleaned. PP-OCRv5_server_rec is
+        # multilingual, reads both scripts, and costs ~15% more OCR time.
+        text_recognition_model_name="PP-OCRv5_server_rec",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
