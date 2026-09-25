@@ -7,6 +7,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -34,6 +35,11 @@ CRITICAL_FREE_RAM_MB = int(os.getenv("TRANSLATOR_CRITICAL_FREE_RAM_MB", "512"))
 RESOURCE_WAIT_SECONDS = int(os.getenv("TRANSLATOR_RESOURCE_WAIT_SECONDS", "90"))
 MAX_CPU_THREADS = int(os.getenv("TRANSLATOR_MAX_CPU_THREADS", "2"))
 CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.75"))
+
+# Lines below the grouping confidence floor are exactly the ones the filters
+# throw away, so they get a second reading from a tight crop before that
+# happens. Matches the floor: a 0.75 line is already trusted as-is.
+RETRY_CONFIDENCE_BELOW = float(os.getenv("OCR_RETRY_CONFIDENCE_BELOW", "0.75"))
 
 
 def available_ram_mb() -> int:
@@ -209,6 +215,65 @@ def main() -> int:
         del tile_array, predictions
         gc.collect()
         print(f"tile {tile_number}/{len(ranges)} complete", flush=True)
+
+    # A tile that begins inside a caption hands the recogniser a degenerate
+    # crop and it answers with garbage at 0.16-0.53 confidence, even though
+    # the very same pixels score 0.92-0.99 from a crop whose edge lands on the
+    # lettering ("JUST AS I EXPECTED," became 'ISAISN' + 'EAAEEE' this way and
+    # was then dropped by the confidence filter, leaving the raw English on the
+    # finished page). Re-read every line that the grouping filters would reject
+    # and keep it only when the tighter read actually wins. Two paddings are
+    # tried: an exact box, which suits a line the tile already framed, and a
+    # small halo, which rescues a line whose first glyphs sat on the tile edge.
+    # Near-ties prefer the longer reading, otherwise the exact crop would win
+    # on confidence while keeping only the middle word of the phrase.
+    for region in regions:
+        if float(region["confidence"]) >= RETRY_CONFIDENCE_BELOW:
+            continue
+        best_text, best_score = region["text"], float(region["confidence"])
+        for pad in (0, 30):
+            box = region["bbox"]
+            x1 = max(0, int(box["x"]) - pad)
+            y1 = max(0, int(box["y"]) - pad)
+            x2 = min(image.width, int(box["x"]) + int(box["width"]) + pad)
+            y2 = min(image.height, int(box["y"]) + int(box["height"]) + pad)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            try:
+                retry_predictions = list(ocr.predict(np.asarray(image.crop((x1, y1, x2, y2)))))
+            except Exception:
+                continue
+            for prediction in retry_predictions:
+                polys = list(prediction.get("rec_polys", []))
+                for index, (text, score) in enumerate(zip(prediction.get("rec_texts", []), prediction.get("rec_scores", []))):
+                    text, score = str(text), float(score)
+                    if not text.strip():
+                        continue
+                    # A padded crop usually spans two stacked lines and the
+                    # detector happily answers with the *neighbouring* one,
+                    # which would duplicate the line below. Only readings that
+                    # still land on this region's own box are admissible.
+                    if index < len(polys):
+                        poly = np.asarray(polys[index])
+                        gx1 = x1 + int(poly[:, 0].min())
+                        gx2 = x1 + int(poly[:, 0].max())
+                        gy1 = y1 + int(poly[:, 1].min())
+                        gy2 = y1 + int(poly[:, 1].max())
+                        if not (gx1 < int(box["x"]) + int(box["width"]) and gx2 > int(box["x"])
+                                and gy1 < int(box["y"]) + int(box["height"]) and gy2 > int(box["y"])):
+                            continue
+                    letters = len(re.sub(r"[^a-z]", "", text, flags=re.I))
+                    winner_letters = len(re.sub(r"[^a-z]", "", best_text, flags=re.I))
+                    better = score > best_score + 0.05
+                    near_tie = abs(score - best_score) <= 0.05 and letters > winner_letters
+                    if better or near_tie:
+                        best_text, best_score = text, score
+                break
+        if best_score > float(region["confidence"]):
+            region["text"] = best_text
+            region["confidence"] = best_score
+            region["status"] = "OK" if best_score >= CONFIDENCE_THRESHOLD else "LOW_OCR_CONFIDENCE"
+            print(f"retry: {best_score:.2f} {best_text!r}", flush=True)
 
     regions.sort(key=lambda region: (region["bbox"]["y"], region["bbox"]["x"]))
     debug = image.copy()
