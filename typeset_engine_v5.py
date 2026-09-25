@@ -343,6 +343,18 @@ def render_page(args):
                 return current_mask,current_anchor
             left,top,right,bottom=box
             page_w,page_h=right-left,bottom-top
+            # The surface box a caption sits in can be far taller than the
+            # lettering itself (an ARTWORK_TEXT surface spans the whole
+            # illustration band). A long translation fitted against that would
+            # sprawl onto the artwork and trip the QC spill guard, so the fit
+            # is clipped to the RAW footprint first -- which is also what the
+            # QC surface polygon is built from.
+            footprint=np.zeros_like(current_mask)
+            fx1=max(0,int(b['x'])-left); fx2=min(page_w,int(b['x'])+int(b['width'])-left)
+            fy1=max(0,int(b['y'])-top);  fy2=min(page_h,int(b['y'])+int(b['height'])-top)
+            if fx2>fx1 and fy2>fy1:
+                footprint[fy1:fy2,fx1:fx2]=255
+                current_mask=cv2.bitwise_and(current_mask,footprint)
             ax,ay=current_anchor
             if rotation<0:
                 # PIL turns this canvas +90 (counter-clockwise); the inverse
