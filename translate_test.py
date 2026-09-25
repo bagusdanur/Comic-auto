@@ -218,21 +218,27 @@ def main() -> int:
 
     # A tile that begins inside a caption hands the recogniser a degenerate
     # crop and it answers with garbage at 0.16-0.53 confidence, even though
-    # the very same pixels score 0.92-0.99 from a crop whose edge lands on the
-    # lettering ("JUST AS I EXPECTED," became 'ISAISN' + 'EAAEEE' this way and
-    # was then dropped by the confidence filter, leaving the raw English on the
-    # finished page). Re-read every line that the grouping filters would reject
-    # and keep it only when the tighter read actually wins. Two paddings are
-    # tried: an exact box, which suits a line the tile already framed, and a
-    # small halo, which rescues a line whose first glyphs sat on the tile edge.
-    # Near-ties prefer the longer reading, otherwise the exact crop would win
-    # on confidence while keeping only the middle word of the phrase.
+    # the very same pixels score 0.92-1.00 from a crop whose edge lands on the
+    # lettering ("JUST AS I EXPECTED," became 'ISAISN' + 'EAAEEE', and
+    # "HEY, DON'T KEEP US WAITING" became 'ANLIAE SE E'). Both were then
+    # dropped by the grouping filters, so nothing removed them either and the
+    # raw English survived onto the finished page.
+    #
+    # Every line below the grouping floor is re-read from a crop of its own
+    # box at three paddings. Readings are kept only when their centre falls
+    # inside this region's box -- a wider crop spans stacked lines and the
+    # detector otherwise answers with the neighbour, duplicating the line
+    # below -- and the survivors of one crop are joined in reading order so a
+    # line the tile shattered into words comes back whole. The crop with the
+    # most coverage wins, which is what recovers "HEY, DON'T KEEP US WAITING"
+    # from three separate fragments.
     for region in regions:
         if float(region["confidence"]) >= RETRY_CONFIDENCE_BELOW:
             continue
-        best_text, best_score = region["text"], float(region["confidence"])
-        for pad in (0, 30):
-            box = region["bbox"]
+        box = region["bbox"]
+        region_letters = len(re.sub(r"[^a-z]", "", region["text"], flags=re.I))
+        best_text, best_score, best_letters = region["text"], float(region["confidence"]), region_letters
+        for pad in (0, 30, 60):
             x1 = max(0, int(box["x"]) - pad)
             y1 = max(0, int(box["y"]) - pad)
             x2 = min(image.width, int(box["x"]) + int(box["width"]) + pad)
@@ -243,32 +249,33 @@ def main() -> int:
                 retry_predictions = list(ocr.predict(np.asarray(image.crop((x1, y1, x2, y2)))))
             except Exception:
                 continue
+            collected = []
             for prediction in retry_predictions:
                 polys = list(prediction.get("rec_polys", []))
                 for index, (text, score) in enumerate(zip(prediction.get("rec_texts", []), prediction.get("rec_scores", []))):
-                    text, score = str(text), float(score)
-                    if not text.strip():
+                    text, score = str(text).strip(), float(score)
+                    if not text or index >= len(polys):
                         continue
-                    # A padded crop usually spans two stacked lines and the
-                    # detector happily answers with the *neighbouring* one,
-                    # which would duplicate the line below. Only readings that
-                    # still land on this region's own box are admissible.
-                    if index < len(polys):
-                        poly = np.asarray(polys[index])
-                        gx1 = x1 + int(poly[:, 0].min())
-                        gx2 = x1 + int(poly[:, 0].max())
-                        gy1 = y1 + int(poly[:, 1].min())
-                        gy2 = y1 + int(poly[:, 1].max())
-                        if not (gx1 < int(box["x"]) + int(box["width"]) and gx2 > int(box["x"])
-                                and gy1 < int(box["y"]) + int(box["height"]) and gy2 > int(box["y"])):
-                            continue
-                    letters = len(re.sub(r"[^a-z]", "", text, flags=re.I))
-                    winner_letters = len(re.sub(r"[^a-z]", "", best_text, flags=re.I))
-                    better = score > best_score + 0.05
-                    near_tie = abs(score - best_score) <= 0.05 and letters > winner_letters
-                    if better or near_tie:
-                        best_text, best_score = text, score
+                    poly = np.asarray(polys[index])
+                    centre_x = x1 + float(poly[:, 0].mean())
+                    centre_y = y1 + float(poly[:, 1].mean())
+                    if not (int(box["x"]) <= centre_x <= int(box["x"]) + int(box["width"])
+                            and int(box["y"]) <= centre_y <= int(box["y"]) + int(box["height"])):
+                        continue
+                    collected.append((centre_y, centre_x, score, text))
                 break
+            if not collected:
+                continue
+            # Lines are stacked at most half a region height apart, so bucket
+            # by that before sorting: same line reads left to right, stacked
+            # lines read top to bottom.
+            band = max(float(box["height"]) * 0.5, 1.0)
+            collected.sort(key=lambda row: (int((row[0] - int(box["y"])) / band), row[1]))
+            joined = " ".join(row[3] for row in collected)
+            joined_letters = len(re.sub(r"[^a-z]", "", joined, flags=re.I))
+            mean_score = sum(row[2] for row in collected) / len(collected)
+            if mean_score > float(region["confidence"]) and joined_letters > best_letters:
+                best_text, best_score, best_letters = joined, mean_score, joined_letters
         if best_score > float(region["confidence"]):
             region["text"] = best_text
             region["confidence"] = best_score
