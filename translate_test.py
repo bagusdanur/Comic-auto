@@ -155,7 +155,13 @@ def main() -> int:
         text_recognition_model_name="PP-OCRv5_server_rec",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
-        use_textline_orientation=False,
+        # Without the textline angle head the detector still finds a vertical
+        # speech line, but the recogniser reads the unrotated strip and returns
+        # garbage ('HUY M MAE' conf 0.33 for "JUST WAIT A LITTLE LONGER"),
+        # which then fails the confidence filter and is never translated or
+        # cleaned. The angle head costs one small inference per line and turns
+        # the same regions into 0.9+ confidence reads.
+        use_textline_orientation=True,
         device="cpu",
         cpu_threads=MAX_CPU_THREADS,
         enable_mkldnn=True,
@@ -177,7 +183,14 @@ def main() -> int:
             texts = list(prediction.get("rec_texts", []))
             scores = list(prediction.get("rec_scores", []))
             polygons = list(prediction.get("rec_polys", []))
-            for text, score, polygon in zip(texts, scores, polygons):
+            # The textline angle head reports 0/180 for each recognised line.
+            # A caption set at a right angle is deskewed internally by
+            # np.rot90 first (see crop_image_regions.get_rotate_crop_image),
+            # so this flag is exactly what tells us whether the printed
+            # letters run clockwise or counter-clockwise of upright -- and
+            # therefore which way the translation has to be rotated back.
+            orientation_angles = list(prediction.get("textline_orientation_angles") or [])
+            for index, (text, score, polygon) in enumerate(zip(texts, scores, polygons)):
                 global_polygon = [[int(x), int(y) + top] for x, y in np.asarray(polygon).tolist()]
                 confidence = float(score)
                 region = {
@@ -186,6 +199,7 @@ def main() -> int:
                     "confidence": confidence,
                     "bbox": bbox_from_polygon(global_polygon),
                     "polygon": global_polygon,
+                    "orientation_angle": int(orientation_angles[index]) if index < len(orientation_angles) else 0,
                     "type": "dialogue",
                     "status": "OK" if confidence >= CONFIDENCE_THRESHOLD else "LOW_OCR_CONFIDENCE",
                     "tile": tile_number,
@@ -229,7 +243,8 @@ def main() -> int:
         "minimum_available_ram_mb": sampler.min_available_mb,
         "models": {
             "detection": "PP-OCRv5_mobile_det",
-            "recognition": "en_PP-OCRv5_mobile_rec",
+            "recognition": "PP-OCRv5_server_rec",
+            "textline_orientation": "PP-LCNet_x1_0_textline_orientation",
         },
     }
     metadata_path = args.output_dir / "ocr-result.json"

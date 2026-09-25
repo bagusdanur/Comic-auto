@@ -200,12 +200,24 @@ def paint_fitted_text(output,bounds,fitted,paint,stroke,outline,rotation=0.0,rot
     """Composite solid/gradient glyphs without painting outside measured ink."""
     x1,y1,x2,y2=bounds;size=(x2-x1,y2-y1)
     origin=(fitted['origin'][0],fitted['origin'][1])
-    fill_mask=Image.new('L',size)
+    # A right-angle caption is fitted against the *transposed* surface, because
+    # its own footprint is tall and narrow and would shrink the translation to
+    # an unreadable sliver. Draw on that transposed canvas and turn the
+    # finished layer by exactly 90 degrees: expand=True maps the canvas back
+    # onto the original bounds with no clipping, and the pivot is the canvas
+    # centre -- which is what placed the anchor when the text was fitted.
+    right_angle=bool(rotation) and abs(abs(rotation)-90)<1
+    canvas=(size[1],size[0]) if right_angle else size
+    fill_mask=Image.new('L',canvas)
     ImageDraw.Draw(fill_mask).multiline_text(origin,fitted['wrapped'],font=fitted['font'],spacing=fitted['spacing'],align=fitted.get('alignment','center'),fill=255)
     if rotation:
+        if right_angle:
+            pivot=(canvas[0]/2,canvas[1]/2)
+        else:
+            pivot=rotation_center or (size[0]/2,size[1]/2)
         fill_mask=fill_mask.rotate(
-            -rotation,resample=Image.Resampling.BICUBIC,expand=False,
-            center=rotation_center or (size[0]/2,size[1]/2),
+            -rotation,resample=Image.Resampling.BICUBIC,
+            expand=right_angle,center=pivot,
         )
     outline_mask=symmetric_outline_mask(fill_mask,stroke)
     if safe_mask is not None and np.any((np.asarray(outline_mask)>0) & (safe_mask==0)):
@@ -320,6 +332,25 @@ def render_page(args):
             left,top,right,bottom=current_bounds
             return (b['x']+b['width']/2-left,b['y']+b['height']/2-top)
         anchor_center=source_anchor(bounds)
+        # Right-angle caption: fit in the transposed canvas (so the translation
+        # can use the caption's *length*), keep the page-space surface for the
+        # glyph guard. fit_space() inverts exactly the turn paint_fitted_text
+        # will apply, so the rotated glyphs land back inside the raw footprint.
+        right_angle=bool(rotation) and abs(abs(rotation)-90)<1
+        page_safe_mask=mask
+        def fit_space(current_mask,current_anchor,box=bounds):
+            if not right_angle:
+                return current_mask,current_anchor
+            left,top,right,bottom=box
+            page_w,page_h=right-left,bottom-top
+            ax,ay=current_anchor
+            if rotation<0:
+                # PIL turns this canvas +90 (counter-clockwise); the inverse
+                # maps a page point (ax,ay) to (page_h-1-ay, ax).
+                return np.rot90(current_mask,k=-1),(page_h-1-ay,ax)
+            # PIL turns it -90 (clockwise); the inverse is (ay, page_w-1-ax).
+            return np.rot90(current_mask,k=+1),(ay,page_w-1-ax)
+        mask,anchor_center=fit_space(mask,anchor_center)
         fitted=fit_text_v5(group['translation'],selected_font,mask,max(22,args.min_font_size),preferred,stroke,anchor_center=anchor_center,alignment=alignment)
         regular_font=args.font_dialogue or args.font
         if not fitted and not is_system_window and str(selected_font)!=str(regular_font):
@@ -335,6 +366,8 @@ def render_page(args):
             if stats.get('light_ratio',1)<.8 and stats.get('dark_ratio',0)>.1:
                 bounds,mask=source_surface_mask(reference,b,{**surface,'surface_type':'ARTWORK_TEXT'},[g['bbox'] for g in groups if g['id']!=group['id']])
                 anchor_center=source_anchor(bounds)
+                page_safe_mask=mask
+                mask,anchor_center=fit_space(mask,anchor_center,box=bounds)
                 stroke=2
                 fitted=fit_text_v5(group['translation'],selected_font,mask,max(22,args.min_font_size),preferred,stroke,anchor_center=anchor_center)
         if not fitted:
@@ -389,7 +422,9 @@ def render_page(args):
         local=np.array(output)[y1:y2,x1:x2]
         dark=float(np.median(local))<100
         outline='black' if sum(color)>600 else 'white' if not dark else 'black'
-        rotation_safe_mask=mask
+        # Right-angle captions fitted in the transposed canvas still have to be
+        # guarded against the *page* surface, which is what page_safe_mask holds.
+        rotation_safe_mask=page_safe_mask
         if rotation and surface.get('surface_type')=='TILTED_CARD':
             # Adjacent form fields make the unrotated exclusion mask extremely
             # tight at glyph corners. Permit only a small card-local keyline

@@ -166,6 +166,29 @@ def is_rectangular_caption(image: np.ndarray, bbox: dict) -> bool:
 
 
 def source_rotation(regions: list[dict]) -> float:
+    """Baseline angle of the RAW lettering, in degrees.
+
+    Two families are recognised: slightly tilted cards (2.5-24 degrees) and
+    captions set at a full right angle. The detector hands a right-angle
+    caption over as a tall *axis-aligned* box, so the polygon's top edge is
+    horizontal and the slant test below reports 0 -- which is why a vertical
+    side caption used to come back as horizontal typeset text.
+    """
+    bboxes = [region.get("bbox") or {} for region in regions]
+    tall = [
+        region for region, box in zip(regions, bboxes)
+        if int(box.get("height", 0)) >= 1.5 * max(1, int(box.get("width", 0)))
+    ]
+    if tall and len(tall) * 2 >= len(regions):
+        # get_rotate_crop_image deskews a tall crop with np.rot90 (counter-
+        # clockwise) and only then lets the textline angle head decide on a
+        # further 180 flip. angle==1 therefore means the printed letters run
+        # counter-clockwise of upright, so the reader turns the page clockwise
+        # to read them and the translation must be painted at -90 to match.
+        # Missing angle data (older OCR reports) falls back to that same
+        # convention, which is what every scanned side caption has used so far.
+        flipped = sum(1 for region in tall if int(region.get("orientation_angle", 1)) == 1)
+        return -90.0 if flipped * 2 >= len(tall) else 90.0
     angles = []
     for region in regions:
         polygon = region.get("polygon") or []
