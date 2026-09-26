@@ -398,10 +398,22 @@ def render_page(args):
                 raw_fitted=fit_constrained_text(group['translation'],selected_font,raw_mask,0,(w/2,h/2))
                 if raw_fitted:
                     stroke=0
-            if raw_fitted:
+            if raw_fitted and not right_angle:
                 bounds,mask,fitted=(x,y,x+w,y+h),raw_mask,raw_fitted
                 anchor_center=(w/2,h/2)
                 fitted['fallback_reason']='RAW_FOOTPRINT_18PX_FLOOR'
+                page_safe_mask=mask
+            elif raw_fitted and right_angle:
+                # Keep the caption's right angle: the rescue fit must run on the
+                # transposed footprint, and the guard must switch to the
+                # page-space footprint that bounds now describes.
+                rescue_mask,rescue_anchor=fit_space(raw_mask,(w/2,h/2),box=(x,y,x+w,y+h))
+                rescue=fit_constrained_text(group['translation'],selected_font,rescue_mask,stroke,rescue_anchor)
+                if rescue:
+                    bounds,mask,fitted=(x,y,x+w,y+h),rescue_mask,rescue
+                    anchor_center=rescue_anchor
+                    page_safe_mask=raw_mask
+                    fitted['fallback_reason']='RAW_FOOTPRINT_18PX_FLOOR'
         if not fitted and is_tiny_sfx and stroke:
             fitted=fit_constrained_text(group['translation'],selected_font,mask,0,anchor_center)
             if fitted:
@@ -423,12 +435,19 @@ def render_page(args):
         letters=[ch for ch in group['text'] if ch.isalpha()]
         comment_case=bool(letters) and sum(ch.isupper() for ch in letters)/len(letters)<.4
         exterior_candidates=comment_candidates(reference,cleaned_reference,b,[g['bbox'] for g in groups if g['id']!=group['id']]) if os.getenv('TYPESET_AUTO_COMMENT','1')=='1' and comment_case else []
-        for candidate_bounds,candidate_mask in exterior_candidates:
-            candidate=fit_text_v5(group['translation'],selected_font,candidate_mask,max(22,args.min_font_size),preferred,stroke)
-            if candidate:
-                bounds,mask,fitted=candidate_bounds,candidate_mask,candidate
-                placement='automatic-exterior-comment-v1'
-                break
+        # An exterior comment re-bases bounds and the surface together, so the
+        # page-space guard has to follow it or paint_fitted_text compares a
+        # glyph layer against a differently shaped mask. A right-angle caption
+        # keeps its transposed fit instead -- re-basing it would un-rotate the
+        # caption it was just measured against.
+        if not right_angle:
+            for candidate_bounds,candidate_mask in exterior_candidates:
+                candidate=fit_text_v5(group['translation'],selected_font,candidate_mask,max(22,args.min_font_size),preferred,stroke)
+                if candidate:
+                    bounds,mask,fitted=candidate_bounds,candidate_mask,candidate
+                    page_safe_mask=mask
+                    placement='automatic-exterior-comment-v1'
+                    break
         x1,y1,x2,y2=bounds
         ox,oy=fitted['origin']
         local=np.array(output)[y1:y2,x1:x2]
