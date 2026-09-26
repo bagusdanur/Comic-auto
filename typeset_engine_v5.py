@@ -196,6 +196,40 @@ def symmetric_outline_mask(fill_mask,stroke):
     return Image.fromarray(cv2.dilate(fill_array,kernel,iterations=1),mode='L')
 
 
+def right_angle_fit_space(page_mask, anchor_center, bounds, rotation, footprint=None):
+    """Map the page-space surface into the transposed canvas a 90 degree caption is fitted on.
+
+    Returns the transposed mask plus the anchor in canvas coordinates. This is
+    the exact inverse of the turn paint_fitted_text applies, so the finished
+    glyphs land back inside the raw footprint; ``footprint`` (a group bbox)
+    clips the fit first, because the surface a caption sits in can be far
+    taller than its lettering and a long translation would otherwise sprawl
+    onto the artwork and trip the QC spill guard. Anything that is not a
+    right angle comes back untouched.
+    """
+    if not (rotation and abs(abs(rotation) - 90) < 1):
+        return page_mask, anchor_center
+    left, top, right, bottom = bounds
+    page_w, page_h = right - left, bottom - top
+    mask = page_mask
+    if footprint is not None:
+        clipped = np.zeros_like(mask)
+        fx1 = max(0, int(footprint["x"]) - left)
+        fx2 = min(page_w, int(footprint["x"]) + int(footprint["width"]) - left)
+        fy1 = max(0, int(footprint["y"]) - top)
+        fy2 = min(page_h, int(footprint["y"]) + int(footprint["height"]) - top)
+        if fx2 > fx1 and fy2 > fy1:
+            clipped[fy1:fy2, fx1:fx2] = 255
+            mask = cv2.bitwise_and(mask, clipped)
+    ax, ay = anchor_center
+    if rotation < 0:
+        # PIL turns this canvas +90 (counter-clockwise); the inverse maps a
+        # page point (ax,ay) to (page_h-1-ay, ax).
+        return np.rot90(mask, k=-1), (page_h - 1 - ay, ax)
+    # PIL turns it -90 (clockwise); the inverse is (ay, page_w-1-ax).
+    return np.rot90(mask, k=+1), (ay, page_w - 1 - ax)
+
+
 def paint_fitted_text(output,bounds,fitted,paint,stroke,outline,rotation=0.0,rotation_center=None,safe_mask=None):
     """Composite solid/gradient glyphs without painting outside measured ink."""
     x1,y1,x2,y2=bounds;size=(x2-x1,y2-y1)
@@ -220,7 +254,17 @@ def paint_fitted_text(output,bounds,fitted,paint,stroke,outline,rotation=0.0,rot
             expand=right_angle,center=pivot,
         )
     outline_mask=symmetric_outline_mask(fill_mask,stroke)
-    if safe_mask is not None and np.any((np.asarray(outline_mask)>0) & (safe_mask==0)):
+    guard=np.asarray(safe_mask) if safe_mask is not None else None
+    if guard is not None and guard.shape!=(size[1],size[0]):
+        # bounds and the page-space surface are re-based together by the raw
+        # footprint rescue and the exterior-comment placement. A caller that
+        # moves one and not the other used to surface as an opaque numpy
+        # broadcast error in the middle of a chapter, so name the invariant.
+        raise RuntimeError(
+            f"V5 glyph guard {guard.shape} does not match bounds {(size[1], size[0])}: "
+            "re-point the page-space surface whenever bounds are re-based"
+        )
+    if guard is not None and np.any((np.asarray(outline_mask)>0) & (guard==0)):
         return False
     crop=output.crop(bounds).convert('RGBA')
     if stroke:
@@ -334,35 +378,14 @@ def render_page(args):
         anchor_center=source_anchor(bounds)
         # Right-angle caption: fit in the transposed canvas (so the translation
         # can use the caption's *length*), keep the page-space surface for the
-        # glyph guard. fit_space() inverts exactly the turn paint_fitted_text
-        # will apply, so the rotated glyphs land back inside the raw footprint.
+        # glyph guard. right_angle_fit_space() inverts exactly the turn
+        # paint_fitted_text applies, so the rotated glyphs land back inside the
+        # raw footprint.
         right_angle=bool(rotation) and abs(abs(rotation)-90)<1
         page_safe_mask=mask
-        def fit_space(current_mask,current_anchor,box=bounds):
-            if not right_angle:
-                return current_mask,current_anchor
-            left,top,right,bottom=box
-            page_w,page_h=right-left,bottom-top
-            # The surface box a caption sits in can be far taller than the
-            # lettering itself (an ARTWORK_TEXT surface spans the whole
-            # illustration band). A long translation fitted against that would
-            # sprawl onto the artwork and trip the QC spill guard, so the fit
-            # is clipped to the RAW footprint first -- which is also what the
-            # QC surface polygon is built from.
-            footprint=np.zeros_like(current_mask)
-            fx1=max(0,int(b['x'])-left); fx2=min(page_w,int(b['x'])+int(b['width'])-left)
-            fy1=max(0,int(b['y'])-top);  fy2=min(page_h,int(b['y'])+int(b['height'])-top)
-            if fx2>fx1 and fy2>fy1:
-                footprint[fy1:fy2,fx1:fx2]=255
-                current_mask=cv2.bitwise_and(current_mask,footprint)
-            ax,ay=current_anchor
-            if rotation<0:
-                # PIL turns this canvas +90 (counter-clockwise); the inverse
-                # maps a page point (ax,ay) to (page_h-1-ay, ax).
-                return np.rot90(current_mask,k=-1),(page_h-1-ay,ax)
-            # PIL turns it -90 (clockwise); the inverse is (ay, page_w-1-ax).
-            return np.rot90(current_mask,k=+1),(ay,page_w-1-ax)
-        mask,anchor_center=fit_space(mask,anchor_center)
+        def fit_space(current_mask,current_anchor,box=bounds,footprint=None):
+            return right_angle_fit_space(current_mask,current_anchor,box,rotation if right_angle else 0,footprint=footprint)
+        mask,anchor_center=fit_space(mask,anchor_center,footprint=b)
         fitted=fit_text_v5(group['translation'],selected_font,mask,max(22,args.min_font_size),preferred,stroke,anchor_center=anchor_center,alignment=alignment)
         regular_font=args.font_dialogue or args.font
         if not fitted and not is_system_window and str(selected_font)!=str(regular_font):
@@ -379,7 +402,7 @@ def render_page(args):
                 bounds,mask=source_surface_mask(reference,b,{**surface,'surface_type':'ARTWORK_TEXT'},[g['bbox'] for g in groups if g['id']!=group['id']])
                 anchor_center=source_anchor(bounds)
                 page_safe_mask=mask
-                mask,anchor_center=fit_space(mask,anchor_center,box=bounds)
+                mask,anchor_center=fit_space(mask,anchor_center,box=bounds,footprint=b)
                 stroke=2
                 fitted=fit_text_v5(group['translation'],selected_font,mask,max(22,args.min_font_size),preferred,stroke,anchor_center=anchor_center)
         if not fitted:
@@ -407,7 +430,7 @@ def render_page(args):
                 # Keep the caption's right angle: the rescue fit must run on the
                 # transposed footprint, and the guard must switch to the
                 # page-space footprint that bounds now describes.
-                rescue_mask,rescue_anchor=fit_space(raw_mask,(w/2,h/2),box=(x,y,x+w,y+h))
+                rescue_mask,rescue_anchor=fit_space(raw_mask,(w/2,h/2),box=(x,y,x+w,y+h),footprint=b)
                 rescue=fit_constrained_text(group['translation'],selected_font,rescue_mask,stroke,rescue_anchor)
                 if rescue:
                     bounds,mask,fitted=(x,y,x+w,y+h),rescue_mask,rescue
