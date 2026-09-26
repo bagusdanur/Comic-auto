@@ -108,6 +108,18 @@ def tile_ranges(height: int) -> list[tuple[int, int]]:
         if bottom == height:
             break
         top = bottom - TILE_OVERLAP
+    # A tail tile shorter than half a tile is a hole, not a tile: at
+    # TILE_HEIGHT=1600/OVERLAP=200 a 13000 px page ends with (12600,13000),
+    # and the detector returns nothing at all from those 400 px while the
+    # same pixels read back at 0.80-0.88 confidence from a 1000 px crop.
+    # ch1 page-001 puts its 'FEAR' box there (y12815-12999), so it was never
+    # detected -- never translated, never removed -- while every other
+    # geometry I tried found it. Fold the tail into the tile before it: the
+    # merged span covers exactly the same rows, just with enough height for
+    # the detector to work in.
+    if len(ranges) > 1 and (ranges[-1][1] - ranges[-1][0]) < max(1, TILE_HEIGHT // 2):
+        ranges[-2] = (ranges[-2][0], ranges[-1][1])
+        ranges.pop()
     return ranges
 
 
