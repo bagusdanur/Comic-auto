@@ -42,6 +42,24 @@ CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.75"))
 RETRY_CONFIDENCE_BELOW = float(os.getenv("OCR_RETRY_CONFIDENCE_BELOW", "0.75"))
 
 
+def retry_better(joined_letters, joined_score, region_letters, region_score):
+    """Accept a tighter re-read in place of the garbage the tile produced.
+
+    Confidence is the judge: a 0.98 reading beats a 0.25 one whatever its
+    length.  The length term only stops a narrow crop from collapsing the
+    line into a token, so it must be *at least half* the original rather than
+    *more* than it.  The old `> region_letters` gate rejected perfect reads
+    because the garbage happened to be letter-rich -- the tile rendered
+    "MOVING NEXT WEEK, RIGHT?" as 'TXENSNIAOE' (10 letters) and 'SLRIIETEEE'
+    (10), while the correct readings are 'MOVING NEXT' (10) and 'WEEK, RIGHT?'
+    (9), so `10 > 10` and `9 > 10` both failed at conf 0.98/0.97 and the raw
+    English stayed on the finished page.
+    """
+    if joined_score <= region_score:
+        return False
+    return joined_letters >= max(3, region_letters // 2)
+
+
 def available_ram_mb() -> int:
     return int(psutil.virtual_memory().available / 1024 / 1024)
 
@@ -274,8 +292,9 @@ def main() -> int:
             joined = " ".join(row[3] for row in collected)
             joined_letters = len(re.sub(r"[^a-z]", "", joined, flags=re.I))
             mean_score = sum(row[2] for row in collected) / len(collected)
-            if mean_score > float(region["confidence"]) and joined_letters > best_letters:
-                best_text, best_score, best_letters = joined, mean_score, joined_letters
+            if retry_better(joined_letters, mean_score, region_letters, float(region["confidence"])):
+                if mean_score > best_score:
+                    best_text, best_score, best_letters = joined, mean_score, joined_letters
         if best_score > float(region["confidence"]):
             region["text"] = best_text
             region["confidence"] = best_score
