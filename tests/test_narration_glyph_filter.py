@@ -63,9 +63,16 @@ class GlyphStillRejectedTest(unittest.TestCase):
         self.assertFalse(passes([region("jHA", confidence=0.51,
                                         width=158, height=1070)]))
 
-    def test_kata_biasa_besar_bukan_sambung_tetap_ditolak(self):
-        self.assertFalse(passes([region("CAT")]))
-        self.assertFalse(passes([region("ZOO")]))
+    def test_kata_biasa_besar_keyakinan_rendah_tetap_ditolak(self):
+        # glyph aslinya dibuat untuk ini: bacaan yakin di bawah 0.85
+        self.assertFalse(passes([region("CAT", confidence=0.60)]))
+        self.assertFalse(passes([region("ZOO", confidence=0.70)]))
+
+    def test_kata_biasa_besar_keyakinan_tinggi_kini_diterima(self):
+        # perubahan disengaja: conf>=0.85 berarti teks nyata, bukan lettering.
+        # 'Cat' conf 1.00 di seluruh repo termasuk yang salah ditolak sebelumnya.
+        self.assertTrue(passes([region("CAT", confidence=1.00)]))
+        self.assertTrue(passes([region("ZOO", confidence=0.90)]))
 
     def test_sfx_kecil_tidak_terpengaruh_ukuran_besar(self):
         # aturan glyph tidak pernah berlaku di bawah 100x100: perilaku lama
@@ -85,13 +92,26 @@ class GlyphRuleScopeTest(unittest.TestCase):
         self.assertTrue(passes([region("YES!!", confidence=0.90,
                                        width=120, height=100)]))
 
-    def test_kata_bertanda_baca_tunggal_perilaku_lama_tidak_berubah(self):
-        # "YES!" (1 tanda baca) tidak cocok pola short_emotional_dialogue dan
-        # bukan kata narasi, jadi tetap kena aturan glyph -- seperti sebelum
-        # perubahan ini. Dipaku di sini supaya perilakunya tidak diam-diam
-        # berubah saat aturan glyph disentuh lagi.
-        self.assertFalse(passes([region("YES!", confidence=0.90,
+    def test_kata_bertanda_baca_tunggal_kini_diterima_berkat_keyakinan(self):
+        # "YES!" (1 tanda baca) tidak cocok pola short_emotional_dialogue, tapi
+        # conf 0.90 >= 0.85 sehingga kini lolos. Dulu ia ditolak sebagai glyph.
+        self.assertTrue(passes([region("YES!", confidence=0.90,
+                                       width=120, height=100)]))
+
+    def test_kata_bertanda_baca_tunggal_keyakinan_rendah_masih_ditolak(self):
+        self.assertFalse(passes([region("YES!", confidence=0.80,
                                         width=120, height=100)]))
+
+    def test_ambang_keyakinan_persis_085(self):
+        # pakai kata non-narasi supaya menguji lever confidence murni:
+        # 'AND' lolos lewat jalur narration_word yang memang tak peduli angka ini
+        self.assertTrue(passes([region("ZOO", confidence=0.85)]))
+        self.assertFalse(passes([region("ZOO", confidence=0.84)]))
+
+    def test_kata_narasi_tidak_peduli_nilai_keyakinan(self):
+        # selama masih di atas lantai trustworthy_region (0.75)
+        self.assertTrue(passes([region("AND", confidence=0.84)]))
+        self.assertFalse(passes([region("AND", confidence=0.70)]))
 
     def test_kata_sambung_multi_kata_di_luar_ukuran_kotak(self):
         # 'AND SO' -> 'ANDSO' = 5 karakter, ujian glyph tak berlaku

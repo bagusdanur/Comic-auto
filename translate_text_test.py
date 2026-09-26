@@ -79,6 +79,9 @@ NARRATION_WORDS = frozenset({
     "now", "not", "the", "all", "one", "two", "who", "why", "how", "what",
 })
 
+# Di atas ambang ini huruf pendek yang terbaca yakin dianggap teks, bukan glyph.
+CONFIDENT_LETTERING = 0.85
+
 
 def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
     def trustworthy_region(region: dict) -> bool:
@@ -131,11 +134,21 @@ def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
         and not is_noise(region["text"])
         # A huge one-glyph/two-glyph OCR region is an integrated action SFX,
         # even when Korean lettering is misread as a Latin fragment such as Hj.
+        # A high-confidence read of a short word is text, not lettering: the
+        # glyph rule was built for action SFX, which the recogniser answers
+        # with 0.1-0.7 confidence ('HHH' 0.32, 'jHA' 0.51, 'Q...' 0.84), while
+        # genuine reactions come back at 0.99-1.00 and were being thrown away
+        # with them -- ch1 page-004 lost 'GET' (conf 1.00, next to its
+        # translated 'DOWN!!') and 'BUT.' (conf 0.99), and across every job
+        # 'NO.', 'HUH?', 'RUN!', 'HEY.', 'AAH!' were all dropped as glyphs.
+        # Below 0.85 nothing changes: 1337 regions sit there and only 3 of them
+        # are real dialogue.
         and not (len(re.sub(r"\W", "", region["text"])) <= 3
                  and int(region["bbox"]["height"]) >= 100
                  and int(region["bbox"]["width"]) >= 100
                  and not short_emotional_dialogue(region)
-                 and not narration_word(region))
+                 and not narration_word(region)
+                 and float(region.get("confidence", 0)) < CONFIDENT_LETTERING)
         # Very thin OCR strips in action-heavy raws are usually UI labels,
         # watermarks, or decorative speed text rather than translatable bubbles.
         # Promo copy ("LIGHTNING-FAST RELEASES WITH PREMIUM QUALITY") measures
