@@ -187,6 +187,25 @@ def source_surface_mask(reference, raw_box, surface, other_boxes):
     return (x1,y1,x2,y2), mask
 
 
+def fit_mask_size(mask, size):
+    """Return the mask exactly `size`, cropping a surplus or padding a shortfall.
+
+    Pillow rounds the expanded bounding box when it rotates: turning the
+    transposed right-angle canvas (219,102) by exactly 90 degrees comes back
+    as (103,220), one pixel over on each axis.  The RGBA layer below is built
+    at `size` and the page-space guard is compared against `size`, so that
+    surplus reached both and raised `operands could not be broadcast together
+    with shapes (220,103) (219,102)` in the middle of Shadow Sovereign ch1.
+    The extra pixel is bounding-box rounding, not glyph ink, so cropping it
+    symmetrically loses nothing; a shortfall is padded with empty ink.
+    """
+    if mask.size == size:
+        return mask
+    fixed = Image.new('L', size)
+    fixed.paste(mask, ((size[0] - mask.size[0]) // 2, (size[1] - mask.size[1]) // 2))
+    return fixed
+
+
 def symmetric_outline_mask(fill_mask,stroke):
     """Expand the exact glyph mask equally in every direction."""
     if stroke <= 0:
@@ -253,6 +272,7 @@ def paint_fitted_text(output,bounds,fitted,paint,stroke,outline,rotation=0.0,rot
             -rotation,resample=Image.Resampling.BICUBIC,
             expand=right_angle,center=pivot,
         )
+    fill_mask=fit_mask_size(fill_mask,size)
     outline_mask=symmetric_outline_mask(fill_mask,stroke)
     guard=np.asarray(safe_mask) if safe_mask is not None else None
     if guard is not None and guard.shape!=(size[1],size[0]):
