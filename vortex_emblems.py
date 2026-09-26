@@ -12,13 +12,26 @@ def red_mask(a):
 def find_emblems(reference,template):
     binary=red_mask(reference);w=reference.shape[1];candidates=[]
     if not np.any(binary):return []
+    page_height=binary.shape[0]
+    # A webtoon can arrive as one 60 000 px strip (chapter 2 is five of them).
+    # A single full-height score map is ~176 MB and there are seven scales,
+    # on top of the RGB page, the HSV mask and the output: the worker sailed
+    # past PM2's 1.47 GB ceiling, was killed, restarted and looped 222 times.
+    # Scan in bands overlapping by one template height instead -- the
+    # detections are identical and the peak stays bounded at any page height.
+    band = 8192
     for base in range(76,101,4):
         width=max(12,round(base*w/800));height=round(width*template.shape[0]/template.shape[1])
-        if height>binary.shape[0] or width>w:continue
+        if height>page_height or width>w:continue
         t=cv2.resize(template,(width,height))
-        scores=cv2.matchTemplate(binary,t,cv2.TM_CCOEFF_NORMED)
-        yy,xx=np.where(scores>.66)
-        candidates.extend((float(scores[y,x]),int(x),int(y),width,height) for y,x in zip(yy,xx))
+        step=max(band,height*2)
+        top=0
+        while top<=page_height-height:
+            bottom=min(page_height,top+step+height-1)
+            scores=cv2.matchTemplate(binary[top:bottom],t,cv2.TM_CCOEFF_NORMED)
+            yy,xx=np.where(scores>.66)
+            candidates.extend((float(scores[y,x]),int(x),int(y+top),width,height) for y,x in zip(yy,xx))
+            top+=step
     selected=[]
     for c in sorted(candidates,reverse=True):
         if any(abs(c[1]-s[1])<c[3] and abs(c[2]-s[2])<c[4] for s in selected):continue

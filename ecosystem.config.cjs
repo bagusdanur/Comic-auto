@@ -43,7 +43,12 @@ module.exports = {
       script: `${root}/queue_worker.py`,
       interpreter: `${root}/.venv/bin/python`,
       autorestart: true,
-      max_memory_restart: '1500M',
+      // Measured 1600 MB peak on a single 60 000 px webtoon page (chapter 2
+      // is five of them): full-page RGBA composites for every replaced logo
+      // plus a full-page emblem scan. Both are now local and banded, but the
+      // floor is still ~1.6 GB, so the old 1500M ceiling killed the worker
+      // mid-branch and PM2 restarted it 222 times in a row.
+      max_memory_restart: '2400M',
       kill_timeout: 15000,
       env: {
         PYTHONUNBUFFERED: '1',

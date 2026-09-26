@@ -708,7 +708,19 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
             layout_details={}
             if logo_layout is not None:
                 mark,pos,layout_details=logo_layout(logo,bounds,mask,output,protected)
-            canvas=Image.fromarray(output).convert('RGBA');canvas.alpha_composite(mark,pos);output=np.array(canvas.convert('RGB'))
+            # Composite only the rectangle the mark touches. The whole-page
+            # RGBA round trip this replaces costs a PIL copy plus a 4-byte
+            # canvas plus a fresh RGB array -- ~487 MB on a 60 000 px webtoon
+            # strip, three times over -- which pushed the worker past PM2's
+            # memory ceiling and got it killed mid job.
+            mx,my=pos
+            sx1,sy1=max(0,mx),max(0,my)
+            sx2,sy2=min(w,mx+mark.width),min(h,my+mark.height)
+            if sx2>sx1 and sy2>sy1:
+                patch=mark.crop((sx1-mx,sy1-my,(sx1-mx)+(sx2-sx1),(sy1-my)+(sy2-sy1)))
+                window=Image.fromarray(output[sy1:sy2,sx1:sx2]).convert('RGBA')
+                window.alpha_composite(patch,(0,0))
+                output[sy1:sy2,sx1:sx2]=np.array(window.convert('RGB'))
             report['replacements'].append({'logo':[pos[0],pos[1]-top,mark.width,mark.height],'mode':'SOURCE_PILL_REPLACEMENT',**layout_details})
         report['decisions'].append(decision)
     # The template match is source-specific and already collision guarded, so
