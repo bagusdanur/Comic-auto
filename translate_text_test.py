@@ -72,6 +72,13 @@ def merge_vertical_fragments(groups: list[dict]) -> list[dict]:
 
 from promo_text import is_noise
 
+# Kata sambung/keterangan narasi yang sah berdiri sendiri di kotak besar,
+# tapi tidak pernah muncul sebagai glyph dekoratif atau SFX aksi.
+NARRATION_WORDS = frozenset({
+    "and", "but", "or", "nor", "so", "yet", "if", "when", "while", "then",
+    "now", "not", "the", "all", "one", "two", "who", "why", "how", "what",
+})
+
 
 def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
     def trustworthy_region(region: dict) -> bool:
@@ -102,6 +109,19 @@ def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
             and re.fullmatch(r"[A-Za-z]{2,5}[.!?.,~…-]{2,}", text)
         )
 
+    def narration_word(region: dict) -> bool:
+        """A short word that belongs to prose rather than to lettering.
+
+        ch1 page-004 stacks "AND" (conf 1.00, 130x106) directly above
+        "WHAT FOLLOWED NEXT WAS-" in identical black boxes; the 13-letter line
+        cleared the size rule and was translated, while the connective above it
+        was rejected as a giant glyph, never grouped, never removed, and the raw
+        English stayed on the finished page. Decorative glyphs and action SFX
+        are not common English connectives, so those keep their place.
+        """
+        word = region["text"].strip().lower()
+        return len(region["text"].split()) == 1 and word in NARRATION_WORDS
+
     clean = [
         region for region in regions
         if region["bbox"]["y"] >= minimum_y
@@ -114,7 +134,8 @@ def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
         and not (len(re.sub(r"\W", "", region["text"])) <= 3
                  and int(region["bbox"]["height"]) >= 100
                  and int(region["bbox"]["width"]) >= 100
-                 and not short_emotional_dialogue(region))
+                 and not short_emotional_dialogue(region)
+                 and not narration_word(region))
         # Very thin OCR strips in action-heavy raws are usually UI labels,
         # watermarks, or decorative speed text rather than translatable bubbles.
         # Promo copy ("LIGHTNING-FAST RELEASES WITH PREMIUM QUALITY") measures
