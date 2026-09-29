@@ -15,7 +15,12 @@ from PIL import Image
 
 from queue_db import connect, new_id, row_dict
 
-SUPPORTED = {".png", ".jpg", ".jpeg", ".webp"}
+# Formats the pipeline can decode. Mist (and several CDNs) serve AVIF pages;
+# Pillow 12 in this venv decodes AVIF natively, so it must be accepted as input.
+SUPPORTED_INPUTS = {".png", ".jpg", ".jpeg", ".webp", ".avif"}
+# Formats we can write back. AVIF is decode-only here -- pages are normalised to
+# PNG -- so it must never be offered as an output extension.
+SUPPORTED_OUTPUTS = {".png", ".jpg", ".jpeg", ".webp"}
 MAX_IMAGES = 60
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_TOTAL_BYTES = 250 * 1024 * 1024
@@ -42,7 +47,7 @@ def collect_inputs(sources: list[Path], destination: Path) -> list[Path]:
             with zipfile.ZipFile(source) as archive:
                 for info in sorted(archive.infolist(), key=lambda item: item.filename.casefold()):
                     member = Path(info.filename.replace("\\", "/"))
-                    if info.is_dir() or member.suffix.casefold() not in SUPPORTED:
+                    if info.is_dir() or member.suffix.casefold() not in SUPPORTED_INPUTS:
                         continue
                     if member.is_absolute() or ".." in member.parts:
                         raise ValueError("Unsafe ZIP path detected")
@@ -55,7 +60,7 @@ def collect_inputs(sources: list[Path], destination: Path) -> list[Path]:
                     with archive.open(info) as reader, target.open("xb") as writer:
                         shutil.copyfileobj(reader, writer, length=1024 * 1024)
                     stored.append(target)
-        elif source.suffix.casefold() in SUPPORTED:
+        elif source.suffix.casefold() in SUPPORTED_INPUTS:
             size = source.stat().st_size
             if size <= 0 or size > MAX_IMAGE_BYTES:
                 raise ValueError("Image is empty or exceeds 25 MB")
@@ -66,7 +71,7 @@ def collect_inputs(sources: list[Path], destination: Path) -> list[Path]:
             shutil.copy2(source, target)
             stored.append(target)
         else:
-            raise ValueError("Inputs must be PNG, JPEG, WebP, or ZIP")
+            raise ValueError("Inputs must be PNG, JPEG, WebP, AVIF, or ZIP")
     if not stored:
         raise ValueError("No supported images were found")
     for path in stored:
@@ -129,7 +134,7 @@ def main() -> int:
                 raise SystemExit("Batch output extension must be ZIP")
             stored_output = output_dir / "chapter-translated.zip"
         else:
-            if output_suffix not in SUPPORTED:
+            if output_suffix not in SUPPORTED_OUTPUTS:
                 raise SystemExit("Output extension must be PNG, JPEG, or WebP")
             stored_output = output_dir / f"{stored_input.stem}{output_suffix}"
         options = {

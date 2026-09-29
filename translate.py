@@ -18,7 +18,11 @@ from PIL import Image
 
 from pipeline_engine import KNOWN_ENGINES, require_implemented, requested_engine
 
-SUPPORTED_INPUTS = {".png", ".jpg", ".jpeg", ".webp"}
+# Formats the pipeline can decode. AVIF is decode-only: Mist and other CDNs
+# serve AVIF pages and Pillow 12 decodes them natively, but results are always
+# written back as PNG/JPEG/WebP, so AVIF is accepted here but never produced.
+SUPPORTED_INPUTS = {".png", ".jpg", ".jpeg", ".webp", ".avif"}
+SUPPORTED_OUTPUTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def is_promo_only_page(ocr: dict) -> bool:
@@ -138,7 +142,7 @@ def main() -> int:
     input_path = args.input.resolve()
     output_path = args.output.resolve()
     if not input_path.is_file() or input_path.suffix.casefold() not in SUPPORTED_INPUTS:
-        raise SystemExit("Input must be an existing PNG, JPEG, or WebP image")
+        raise SystemExit("Input must be an existing PNG, JPEG, WebP, or AVIF image")
     # A truncated or empty upload reaches PIL as an opaque UnidentifiedImageError
     # deep inside the OCR stage, making the queue record a confusing OCR failure.
     # Reject it here with a stable reason the worker can surface directly.
@@ -146,7 +150,7 @@ def main() -> int:
         raise SystemExit("INPUT_FILE_EMPTY: input image has zero bytes")
     if input_path == output_path:
         raise SystemExit("Refusing to overwrite the original image")
-    if output_path.suffix.casefold() not in SUPPORTED_INPUTS:
+    if output_path.suffix.casefold() not in SUPPORTED_OUTPUTS:
         raise SystemExit("Output extension must be PNG, JPEG, or WebP")
 
     job_dir = (args.job_dir or root / "output" / f"{input_path.stem}-job").resolve()
