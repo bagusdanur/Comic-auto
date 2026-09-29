@@ -26,6 +26,26 @@ def _webp_bytes(image: Image.Image, quality: int) -> bytes:
     return buffer.getvalue()
 
 
+def page_webp_members(source: Path, quality: int = WEBP_QUALITY) -> list[tuple[str, bytes]]:
+    """WebP members for ONE rendered page, named exactly as `archive_webp` does.
+
+    A page taller than MAX_CONVERT_HEIGHT is split into SPLIT_HEIGHT parts so a
+    single-page download carries the same member(s) the chapter archive holds for
+    that page — `001_001.webp`, or `001_001_part01.webp` + `..._part02.webp`.
+    """
+    with Image.open(source) as opened:
+        stem = source.stem
+        if opened.height <= MAX_CONVERT_HEIGHT:
+            return [(f"{stem}.webp", _webp_bytes(opened, quality))]
+        members: list[tuple[str, bytes]] = []
+        part = 1
+        for y in range(0, opened.height, SPLIT_HEIGHT):
+            chunk = opened.crop((0, y, opened.width, min(opened.height, y + SPLIT_HEIGHT)))
+            members.append((f"{stem}_part{part:02d}.webp", _webp_bytes(chunk, quality)))
+            part += 1
+        return members
+
+
 def archive_webp(images: list[Path], destination: Path, quality: int = WEBP_QUALITY) -> int:
     """Atomically archive images as WebP using dashboard-converter settings."""
     destination.parent.mkdir(parents=True, exist_ok=True)

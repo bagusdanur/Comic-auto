@@ -659,6 +659,48 @@ export async function buildApp(): Promise<FastifyInstance> {
       return reply.code(409).send({ error: stageErrorMessage(error) });
     }
   });
+  app.get("/api/images/:imageId/download", async (request, reply) => {
+    const { imageId } = request.params as { imageId: string };
+    const row = database.prepare(
+      "SELECT i.output_path,i.filename,j.options_json FROM images i JOIN jobs j ON j.id=i.job_id WHERE i.id=?"
+    ).get(imageId) as SqlRow | undefined;
+    if (!row) return reply.code(404).send({ error: "Image not found" });
+    const source = String(row.output_path);
+    // A page is delivered as .webp, or as a .zip when it is taller than the
+    // archive split (the renderer decides, and prints the path it wrote). The
+    // extension is therefore discovered, never assumed. A cached file older than
+    // the rendered page is stale — the same freshness rule the preview uses.
+    const directory = resolve(dirname(source), "downloads");
+    await mkdir(directory, { recursive: true });
+    const stem = basename(source, extname(source));
+    const candidates = [resolve(directory, `${stem}.webp`), resolve(directory, `${stem}.zip`)];
+    let deliver: string | null = null;
+    for (const candidate of candidates) {
+      try {
+        const [sourceStat, cachedStat] = await Promise.all([stat(source), stat(candidate)]);
+        if (cachedStat.mtimeMs >= sourceStat.mtimeMs) deliver = candidate;
+      } catch {
+        // Not built yet, or removed: try the next candidate.
+      }
+    }
+    if (!deliver) {
+      await Promise.all(candidates.map((candidate) => rm(candidate, { force: true })));
+      const { stdout } = await execFile(pythonPath, [reviewScript, "page", source, directory], { cwd: projectRoot });
+      const written = String(stdout).trim().split("\n").filter(Boolean).at(-1);
+      if (!written || !(await pathExists(written))) {
+        return reply.code(409).send({ error: "Halaman belum punya hasil render." });
+      }
+      deliver = written;
+    }
+    const options = JSON.parse(String(row.options_json ?? "{}")) as Record<string, unknown>;
+    const title = folderSlug(String(options.title_slug || options.comic_title || "komik"), "komik");
+    const chapter = folderSlug(String(options.chapter || "1").replace(/^\s*(?:chapter|ch)\s*[-_. ]*/i, ""), "1");
+    const page = folderSlug(String(row.filename).replace(/\.[^.]+$/, ""), "page");
+    const suffix = extname(deliver).toLowerCase() === ".zip" ? ".zip" : ".webp";
+    reply.header("Content-Disposition", `attachment; filename="${title}-ch-${chapter}-${page}${suffix}"`);
+    reply.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    return reply.type(suffix === ".zip" ? "application/zip" : "image/webp").send(createReadStream(deliver));
+  });
   app.get("/api/jobs/:jobId/download", async (request, reply) => {
     const { jobId } = request.params as { jobId: string };
     const row = database.prepare("SELECT status,output_path,options_json FROM jobs WHERE id=?").get(jobId) as SqlRow | undefined;

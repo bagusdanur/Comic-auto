@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from webp_archive import archive_webp
+from webp_archive import archive_webp, page_webp_members
 
 from typeset_test import fit_text
 
@@ -113,6 +113,27 @@ def archive(source: Path, destination: Path) -> None:
     archive_webp(list(source.glob("*.png")), destination)
 
 
+def page_file(source: Path, directory: Path) -> Path:
+    """Write ONE page into `directory` and return the file that was written.
+
+    The extension is decided here because only this side knows whether the page
+    is taller than the archive split: a short page becomes `<stem>.webp`, a tall
+    one becomes `<stem>.zip` holding the `_partNN.webp` members the chapter ZIP
+    uses. The caller receives the concrete path so it never has to guess.
+    """
+    members = page_webp_members(source)
+    directory.mkdir(parents=True, exist_ok=True)
+    if len(members) == 1:
+        target = directory / f"{source.stem}.webp"
+        target.write_bytes(members[0][1])
+        return target
+    target = directory / f"{source.stem}.zip"
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, payload in members:
+            archive.writestr(name, payload)
+    return target
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -137,11 +158,16 @@ def main() -> int:
     make_archive = commands.add_parser("archive")
     make_archive.add_argument("source", type=Path)
     make_archive.add_argument("destination", type=Path)
+    make_page = commands.add_parser("page")
+    make_page.add_argument("source", type=Path)
+    make_page.add_argument("directory", type=Path)
     args = parser.parse_args()
     if args.command == "preview":
         preview(args.source, args.destination, args.max_width)
     elif args.command == "archive":
         archive(args.source, args.destination)
+    elif args.command == "page":
+        print(page_file(args.source, args.directory))
     else:
         render(args)
     return 0

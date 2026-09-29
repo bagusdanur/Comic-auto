@@ -51,6 +51,7 @@ test("missing jobs return 404 and render validates its region", async () => {
   assert.equal((await app.inject({ method: "DELETE", url: "/api/jobs/missing" })).statusCode, 404);
   assert.equal((await app.inject({ method: "POST", url: "/api/images/missing/render" })).statusCode, 400);
   assert.equal((await app.inject({ method: "POST", url: "/api/images/missing/render", payload: { regionId: "missing" } })).statusCode, 404);
+  assert.equal((await app.inject({ method: "GET", url: "/api/images/missing/download" })).statusCode, 404);
   await app.close();
 });
 

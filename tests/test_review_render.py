@@ -2,11 +2,12 @@ import argparse
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw
 
-from review_render import archive, preview, render
+from review_render import archive, page_file, preview, render
 
 
 def _args(root: Path, box: dict, translation: str, font_size: int, **overrides) -> argparse.Namespace:
@@ -93,6 +94,35 @@ class ReviewRenderTest(unittest.TestCase):
             message = str(raised.exception)
             self.assertIn("160x60", message)
             self.assertIn("Perbesar kotak", message)
+
+    def test_page_file_downloads_a_single_webp(self):
+        """A short page downloads as one .webp named after the page."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGB", (120, 400), "white").save(root / "001_001.png")
+            written = page_file(root / "001_001.png", root / "downloads")
+            self.assertEqual(written.name, "001_001.webp")
+            self.assertTrue(written.exists())
+            with Image.open(written) as image:
+                self.assertEqual(image.format, "WEBP")
+                self.assertEqual(image.size, (120, 400))
+
+    def test_page_file_splits_a_tall_page_into_a_zip(self):
+        """A page past the archive split must match the chapter ZIP members.
+
+        The chapter archive writes `NNN_part01.webp` for a page taller than
+        MAX_CONVERT_HEIGHT; the per-page download must produce the same members
+        so an operator can swap one page without re-downloading the chapter.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGB", (60, 20000), "white").save(root / "002_002.png")
+            written = page_file(root / "002_002.png", root / "downloads")
+            self.assertEqual(written.suffix, ".zip")
+            with zipfile.ZipFile(written) as archive_file:
+                names = archive_file.namelist()
+            self.assertEqual(names, ["002_002_part01.webp", "002_002_part02.webp"])
+            self.assertEqual(written.name, "002_002.zip")
 
 
 if __name__ == "__main__":
