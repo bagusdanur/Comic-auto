@@ -124,6 +124,66 @@ class ReviewRenderTest(unittest.TestCase):
             self.assertEqual(names, ["002_002_part01.webp", "002_002_part02.webp"])
             self.assertEqual(written.name, "002_002.zip")
 
+    def test_crop_trims_a_leftover_banner_from_the_delivered_page(self):
+        """A crop must shorten the delivered page, leaving the master intact.
+
+        The complaint: source pages carry a leftover logo/banner strip at the top
+        or bottom, and the operator wants it gone from the downloaded ZIP without
+        editing the review master. The page download therefore applies the stored
+        crop while the PNG on disk keeps its full height.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            master = root / "001_001.png"
+            Image.new("RGB", (200, 1000), "white").save(master)
+            written = page_file(master, root / "downloads", crop_top=200, crop_bottom=100)
+            with Image.open(written) as image:
+                self.assertEqual(image.size, (200, 700))
+            with Image.open(master) as untouched:
+                self.assertEqual(untouched.size, (200, 1000))
+
+    def test_archive_applies_per_page_crops(self):
+        """The chapter ZIP must honour each page's stored crop, not just one.
+
+        `archive(..., database)` reads crop_top/crop_bottom per page, so a crop
+        set in the editor reaches the delivered chapter archive.
+        """
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("001_001.png", "002_002.png"):
+                Image.new("RGB", (200, 1000), "white").save(root / name)
+            database_path = root / "translator.sqlite3"
+            connection = sqlite3.connect(database_path)
+            connection.execute("CREATE TABLE images (output_path TEXT, crop_top INTEGER, crop_bottom INTEGER)")
+            connection.execute("INSERT INTO images VALUES (?,?,?)", (str(root / "002_002.png"), 300, 0))
+            connection.commit()
+            connection.close()
+
+            destination = root / "chapter.zip"
+            archive(root, destination, database_path)
+            with zipfile.ZipFile(destination) as output:
+                self.assertEqual(output.namelist(), ["001_001.webp", "002_002.webp"])
+                with Image.open(output.open("001_001.webp")) as cropped_page:
+                    self.assertEqual(cropped_page.size, (200, 1000))
+                with Image.open(output.open("002_002.webp")) as cropped_page:
+                    self.assertEqual(cropped_page.size, (200, 700))
+
+    def test_crop_never_delivers_an_empty_page(self):
+        """An oversized crop must clamp to a sliver, not pad or empty the page.
+
+        PIL's `crop` pads a box outside the image, which would silently grow the
+        page instead of trimming it; the crop helper clamps so the result always
+        has at least one row.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGB", (200, 500), "white").save(root / "001_001.png")
+            written = page_file(root / "001_001.png", root / "downloads", crop_top=900, crop_bottom=900)
+            with Image.open(written) as image:
+                self.assertEqual(image.size, (200, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

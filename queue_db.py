@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS images (
     status TEXT NOT NULL,
     output_path TEXT,
     metadata_path TEXT,
-    region_count INTEGER NOT NULL DEFAULT 0
+    region_count INTEGER NOT NULL DEFAULT 0,
+    crop_top INTEGER NOT NULL DEFAULT 0,
+    crop_bottom INTEGER NOT NULL DEFAULT 0,
+    crop_updated_at REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS regions (
     id TEXT PRIMARY KEY,
@@ -122,6 +125,12 @@ def connect(path: Path) -> sqlite3.Connection:
     image_columns = {row[1] for row in database.execute("PRAGMA table_info(images)")}
     if "metadata_path" not in image_columns:
         database.execute("ALTER TABLE images ADD COLUMN metadata_path TEXT")
+    if "crop_top" not in image_columns:
+        database.execute("ALTER TABLE images ADD COLUMN crop_top INTEGER NOT NULL DEFAULT 0")
+    if "crop_bottom" not in image_columns:
+        database.execute("ALTER TABLE images ADD COLUMN crop_bottom INTEGER NOT NULL DEFAULT 0")
+    if "crop_updated_at" not in image_columns:
+        database.execute("ALTER TABLE images ADD COLUMN crop_updated_at REAL NOT NULL DEFAULT 0")
     now = time.time()
     defaults = {
         "concurrency": "1", "minimum_free_ram_mb": "2000",
@@ -134,6 +143,29 @@ def connect(path: Path) -> sqlite3.Connection:
         )
     database.commit()
     return database
+
+
+def load_crops(database: sqlite3.Connection, images: list[Path]) -> dict[str, tuple[int, int]]:
+    """Map each rendered PNG file name to its stored `(crop_top, crop_bottom)`.
+
+    The archive only ever sees output paths, so a stored row is matched back to
+    the file by resolved name. Pages with no crop (the common case) are omitted,
+    letting callers treat a missing key as `(0, 0)`.
+    """
+    wanted = {str(path.resolve()): path.name for path in images}
+    crops: dict[str, tuple[int, int]] = {}
+    columns = {row[1] for row in database.execute("PRAGMA table_info(images)")}
+    if not {"crop_top", "crop_bottom"} <= columns:
+        return crops
+    for row in database.execute("SELECT output_path,crop_top,crop_bottom FROM images"):
+        if not row["output_path"]:
+            continue
+        name = wanted.get(str(Path(row["output_path"]).resolve()))
+        top = int(row["crop_top"] or 0)
+        bottom = int(row["crop_bottom"] or 0)
+        if name and (top or bottom):
+            crops[name] = (top, bottom)
+    return crops
 
 
 def row_dict(row: sqlite3.Row | None) -> dict | None:

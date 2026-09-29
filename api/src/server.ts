@@ -81,6 +81,91 @@ export function stageErrorMessage(error: unknown): string {
   return last || "Render gagal.";
 }
 
+/**
+ * Rebuild a job's chapter WebP archive from its rendered PNGs.
+ *
+ * `review_render.py archive --db` reads the per-page crops from the database, so
+ * the ZIP always reflects the trims the operator set in the editor. A failure is
+ * logged and reported, never thrown: a stale archive must not block the crop
+ * itself from being saved.
+ */
+async function rebuildArchive(jobOutput: string, log: { warn: (value: unknown) => void }): Promise<boolean> {
+  if (extname(jobOutput).toLowerCase() !== ".zip") return false;
+  try {
+    await execFile(pythonPath, [reviewScript, "archive", dirname(jobOutput), jobOutput, "--db", databasePath], { cwd: projectRoot, maxBuffer: 1024 * 1024 });
+    return true;
+  } catch (error) {
+    log.warn(error);
+    return false;
+  }
+}
+
+/**
+ * Delete every cached preview for one page.
+ *
+ * Previews are cached per requested width (`{imageId}@{width}.jpg`), so anything
+ * that changes the rendered pixels — a re-render, or a new crop — invalidates all
+ * width variants, not just one.
+ */
+async function clearPreviews(outputPath: string, imageId: string): Promise<void> {
+  const previewDir = resolve(dirname(outputPath), "previews");
+  try {
+    for (const name of await readdir(previewDir)) {
+      if (name.startsWith(`${imageId}@`) || name === `${imageId}.jpg`) {
+        await rm(resolve(previewDir, name), { force: true });
+      }
+    }
+  } catch {
+    // No previews directory yet: nothing to invalidate.
+  }
+}
+
+/**
+ * Delete the cached single-page download(s) for one page.
+ *
+ * `GET /api/images/:id/download` caches `<stem>.webp` / `<stem>.zip` beside the
+ * rendered page; a crop changes what those files must contain.
+ */
+async function clearDownloads(outputPath: string): Promise<void> {
+  const directory = resolve(dirname(outputPath), "downloads");
+  const stem = basename(outputPath, extname(outputPath));
+  try {
+    for (const name of await readdir(directory)) {
+      if (name === `${stem}.webp` || name === `${stem}.zip` || name.startsWith(`${stem}_part`)) {
+        await rm(resolve(directory, name), { force: true });
+      }
+    }
+  } catch {
+    // No downloads directory yet: nothing to invalidate.
+  }
+}
+
+/** Crop values for a page, defaulting to no trim. */
+function cropOf(row: SqlRow): { cropTop: number; cropBottom: number; cropUpdatedMs: number } {
+  return {
+    cropTop: Math.max(0, Number(row.crop_top ?? 0) || 0),
+    cropBottom: Math.max(0, Number(row.crop_bottom ?? 0) || 0),
+    cropUpdatedMs: Math.max(0, Number(row.crop_updated_at ?? 0) || 0) * 1000,
+  };
+}
+
+/**
+ * Validate a requested crop, returning the message to show or `null` when fine.
+ *
+ * A crop that consumes the whole page would deliver an empty image, so it is
+ * rejected with the numbers spelled out — the operator can see exactly which
+ * value overshot rather than watching the page vanish.
+ */
+export function cropError(height: number, cropTop: number, cropBottom: number): string | null {
+  if (!Number.isFinite(cropTop) || !Number.isFinite(cropBottom) || cropTop < 0 || cropBottom < 0) {
+    return "Nilai potongan harus angka ≥ 0.";
+  }
+  if (height > 0 && cropTop + cropBottom > height - 1) {
+    return `Potongan (${cropTop}+${cropBottom}) melebihi tinggi halaman (${height}px).`;
+  }
+  return null;
+}
+
 function requireToken(request: { headers: Record<string, unknown> }): boolean {
   const expected = process.env.TRANSLATOR_API_TOKEN;
   if (!expected) return true;
@@ -541,7 +626,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
   app.get("/api/images/:imageId/preview", async (request, reply) => {
     const { imageId } = request.params as { imageId: string };
-    const row = database.prepare("SELECT output_path FROM images WHERE id=?").get(imageId) as SqlRow | undefined;
+    const row = database.prepare("SELECT output_path,crop_top,crop_bottom,crop_updated_at FROM images WHERE id=?").get(imageId) as SqlRow | undefined;
     if (!row) return reply.code(404).send({ error: "Image not found" });
     const source = String(row.output_path);
     // Webtoon review shows every page stacked at full width, so the reader can
@@ -550,19 +635,30 @@ export async function buildApp(): Promise<FastifyInstance> {
     // cached thumbnail every other view relies on.
     const requested = Number.parseInt(String((request.query as Record<string, string>).w ?? ""), 10);
     const maxWidth = Number.isFinite(requested) ? Math.min(1600, Math.max(120, requested)) : 420;
-    const destination = resolve(dirname(source), "previews", `${imageId}@${maxWidth}.jpg`);
+    // Page mode edits regions against the FULL page, so its preview must stay
+    // uncropped or every region box would be offset by the trim. Webtoon mode is
+    // the reading view and asks for `crop=1` to show the delivered result.
+    const wantsCrop = String((request.query as Record<string, string>).crop ?? "") === "1";
+    const stored = cropOf(row);
+    const cropTop = wantsCrop ? stored.cropTop : 0;
+    const cropBottom = wantsCrop ? stored.cropBottom : 0;
+    const cropSuffix = cropTop || cropBottom ? `-c${cropTop}-${cropBottom}` : "";
+    const destination = resolve(dirname(source), "previews", `${imageId}@${maxWidth}${cropSuffix}.jpg`);
     let refreshPreview = false;
     try {
       await access(destination);
-      // Regenerate when the rendered page is newer than the cached preview.
-      const [sourceStat, previewStat] = await Promise.all([stat(source), stat(destination)]);
-      refreshPreview = sourceStat.mtimeMs > previewStat.mtimeMs;
+      // Regenerate when the rendered page — or the crop — is newer than the
+      // cached preview. The crop timestamp is a DB column, not a file mtime, so
+      // it is compared explicitly.
+      const sourceStat = await stat(source);
+      const previewStat = await stat(destination);
+      refreshPreview = sourceStat.mtimeMs > previewStat.mtimeMs || (wantsCrop && stored.cropUpdatedMs > previewStat.mtimeMs);
     } catch {
       refreshPreview = true;
     }
     if (refreshPreview) {
       await mkdir(dirname(destination), { recursive: true });
-      await execFile(pythonPath, [reviewScript, "preview", source, destination, "--max-width", String(maxWidth)], { cwd: projectRoot });
+      await execFile(pythonPath, [reviewScript, "preview", source, destination, "--max-width", String(maxWidth), "--crop-top", String(cropTop), "--crop-bottom", String(cropBottom)], { cwd: projectRoot });
     }
     return reply.type("image/jpeg").header("Cache-Control", "no-store").send(createReadStream(destination));
   });
@@ -603,6 +699,43 @@ export async function buildApp(): Promise<FastifyInstance> {
       .run(translation.toUpperCase(), JSON.stringify(bbox), JSON.stringify(metadata), regionId);
     return { id: regionId, translation: translation.toUpperCase(), bbox, metadata, status: "EDITED" };
   });
+  app.patch("/api/images/:imageId/crop", async (request, reply) => {
+    const { imageId } = request.params as { imageId: string };
+    const body = request.body as { cropTop?: number; cropBottom?: number; applyToAll?: boolean };
+    const row = database.prepare(
+      "SELECT i.id,i.height,i.output_path,j.id job_id,j.output_path job_output_path FROM images i JOIN jobs j ON j.id=i.job_id WHERE i.id=?"
+    ).get(imageId) as SqlRow | undefined;
+    if (!row) return reply.code(404).send({ error: "Image not found" });
+    const height = Number(row.height) || 0;
+    const cropTop = Math.round(Number(body?.cropTop ?? 0));
+    const cropBottom = Math.round(Number(body?.cropBottom ?? 0));
+    const invalid = cropError(height, cropTop, cropBottom);
+    if (invalid) return reply.code(400).send({ error: invalid });
+    const now = Date.now() / 1000;
+    const targets = body?.applyToAll
+      ? database.prepare("SELECT id,output_path FROM images WHERE job_id=?").all(String(row.job_id)) as SqlRow[]
+      : [{ id: imageId, output_path: row.output_path }];
+    const update = database.prepare("UPDATE images SET crop_top=?,crop_bottom=?,crop_updated_at=? WHERE id=?");
+    for (const target of targets) {
+      update.run(cropTop, cropBottom, now, String(target.id));
+    }
+    // The archive and the per-page download are both built from the rendered
+    // PNGs, so every affected page's caches must go before the ZIP is rebuilt.
+    for (const target of targets) {
+      if (!target.output_path) continue;
+      await clearPreviews(String(target.output_path), String(target.id));
+      await clearDownloads(String(target.output_path));
+    }
+    const jobOutput = String(row.job_output_path ?? "");
+    const archiveRebuilt = await rebuildArchive(jobOutput, request.log);
+    return {
+      imageId,
+      cropTop,
+      cropBottom,
+      appliedTo: targets.length,
+      archiveRebuilt,
+    };
+  });
   app.post("/api/images/:imageId/render", async (request, reply) => {
     const { imageId } = request.params as { imageId: string };
     const body = request.body as { regionId?: string };
@@ -633,26 +766,13 @@ export async function buildApp(): Promise<FastifyInstance> {
         "--stroke-width", String(metadata.stroke_width ?? 0), "--stroke-color", JSON.stringify(strokeColor),
       ], { cwd: projectRoot, maxBuffer: 1024 * 1024 });
       const jobOutput = String(row.job_output_path);
-      if (extname(jobOutput).toLowerCase() === ".zip") {
-        await execFile(pythonPath, [reviewScript, "archive", dirname(output), jobOutput], { cwd: projectRoot });
-      }
+      await rebuildArchive(jobOutput, request.log);
       database.prepare("UPDATE regions SET status='TYPESET' WHERE id=?").run(body.regionId);
       const review = database.prepare("SELECT count(*) count FROM regions r JOIN images i ON i.id=r.image_id WHERE i.job_id=? AND r.status='NEEDS_REVIEW'").get(String(row.job_id)) as SqlRow;
       const reviewCount = Number(review.count);
       database.prepare("UPDATE jobs SET review_count=?,status=CASE WHEN ?=0 AND status='REVIEW' THEN 'COMPLETED' ELSE status END,updated_at=? WHERE id=?")
       .run(reviewCount, reviewCount, Date.now() / 1000, String(row.job_id));
-      // Previews are cached per requested width (`{imageId}@{width}.jpg`), so a
-      // re-render must invalidate every width variant, not just one.
-      const previewDir = resolve(dirname(output), "previews");
-      try {
-        for (const name of await readdir(previewDir)) {
-          if (name.startsWith(`${imageId}@`) || name === `${imageId}.jpg`) {
-            await rm(resolve(previewDir, name), { force: true });
-          }
-        }
-      } catch {
-        // No previews directory yet: nothing to invalidate.
-      }
+      await clearPreviews(output, imageId);
       return { imageId, regionId: body.regionId, status: "TYPESET", reviewCount };
     } catch (error) {
       request.log.warn(error);
@@ -662,14 +782,16 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.get("/api/images/:imageId/download", async (request, reply) => {
     const { imageId } = request.params as { imageId: string };
     const row = database.prepare(
-      "SELECT i.output_path,i.filename,j.options_json FROM images i JOIN jobs j ON j.id=i.job_id WHERE i.id=?"
+      "SELECT i.output_path,i.filename,i.crop_top,i.crop_bottom,i.crop_updated_at,j.options_json FROM images i JOIN jobs j ON j.id=i.job_id WHERE i.id=?"
     ).get(imageId) as SqlRow | undefined;
     if (!row) return reply.code(404).send({ error: "Image not found" });
     const source = String(row.output_path);
     // A page is delivered as .webp, or as a .zip when it is taller than the
     // archive split (the renderer decides, and prints the path it wrote). The
     // extension is therefore discovered, never assumed. A cached file older than
-    // the rendered page is stale — the same freshness rule the preview uses.
+    // the rendered page — or older than the last crop — is stale, the same
+    // freshness rule the preview uses.
+    const { cropTop, cropBottom, cropUpdatedMs } = cropOf(row);
     const directory = resolve(dirname(source), "downloads");
     await mkdir(directory, { recursive: true });
     const stem = basename(source, extname(source));
@@ -677,15 +799,16 @@ export async function buildApp(): Promise<FastifyInstance> {
     let deliver: string | null = null;
     for (const candidate of candidates) {
       try {
-        const [sourceStat, cachedStat] = await Promise.all([stat(source), stat(candidate)]);
-        if (cachedStat.mtimeMs >= sourceStat.mtimeMs) deliver = candidate;
+        const sourceStat = await stat(source);
+        const cachedStat = await stat(candidate);
+        if (cachedStat.mtimeMs >= sourceStat.mtimeMs && cachedStat.mtimeMs >= cropUpdatedMs) deliver = candidate;
       } catch {
         // Not built yet, or removed: try the next candidate.
       }
     }
     if (!deliver) {
       await Promise.all(candidates.map((candidate) => rm(candidate, { force: true })));
-      const { stdout } = await execFile(pythonPath, [reviewScript, "page", source, directory], { cwd: projectRoot });
+      const { stdout } = await execFile(pythonPath, [reviewScript, "page", source, directory, "--crop-top", String(cropTop), "--crop-bottom", String(cropBottom)], { cwd: projectRoot });
       const written = String(stdout).trim().split("\n").filter(Boolean).at(-1);
       if (!written || !(await pathExists(written))) {
         return reply.code(409).send({ error: "Halaman belum punya hasil render." });

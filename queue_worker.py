@@ -20,7 +20,7 @@ from PIL import Image
 
 from brand_postprocess import apply_branding
 from branding_coordinates import project_region
-from queue_db import claim_next, connect
+from queue_db import claim_next, connect, load_crops
 from webp_archive import archive_webp
 
 
@@ -241,7 +241,8 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
     final_status = "REVIEW" if review_count else "COMPLETED"
     if options.get("batch"):
         archive_path = Path(job["output_path"])
-        archive_webp(outputs, archive_path)
+        crops = load_crops(database, outputs)
+        archive_webp(outputs, archive_path, crops=crops)
     requested = job.get("requested_output_path")
     if requested:
         Path(requested).parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +253,31 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
         (final_status, review_count, now, now, job["id"]),
     )
     database.commit()
+    prune_job_scratch(job_root)
+
+
+def prune_job_scratch(job_root: Path) -> None:
+    """Drop regenerable scratch files once a job is done.
+
+    Each page stores three full-size PNGs plus debug renderings; across a
+    library that is tens of gigabytes and the disk fills up. cleaned.png and
+    typeset.png are kept because the review and maintenance tools compare them
+    pixel-for-pixel, but the debug draws are pure diagnostics and can always be
+    re-created by re-running the stage that wrote them.
+    """
+    scratch = ("debug-bboxes.jpg",)
+    freed = 0
+    removed = 0
+    for path in job_root.glob("metadata/page-*/*"):
+        if path.name in scratch and path.is_file():
+            try:
+                freed += path.stat().st_size
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"pruned {removed} debug file(s), freed {freed/1e6:.1f} MB", flush=True)
 
 
 def main() -> int:

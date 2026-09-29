@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildApp, jobDownloadFilename, stageErrorMessage } from "./server.js";
+import { buildApp, cropError, jobDownloadFilename, stageErrorMessage } from "./server.js";
 
 test("stage error message surfaces the pipeline reason, not the command", () => {
   // What execFile actually rejects with: the command line, a Python traceback
@@ -52,7 +52,19 @@ test("missing jobs return 404 and render validates its region", async () => {
   assert.equal((await app.inject({ method: "POST", url: "/api/images/missing/render" })).statusCode, 400);
   assert.equal((await app.inject({ method: "POST", url: "/api/images/missing/render", payload: { regionId: "missing" } })).statusCode, 404);
   assert.equal((await app.inject({ method: "GET", url: "/api/images/missing/download" })).statusCode, 404);
+  assert.equal((await app.inject({ method: "PATCH", url: "/api/images/missing/crop", payload: { cropTop: 10 } })).statusCode, 404);
   await app.close();
+});
+
+test("crop validation rejects values that would empty the page", () => {
+  // A leftover banner is trimmed by a plain pixel count; the guard only fires
+  // when the trim would consume the whole page or a negative value arrives.
+  assert.equal(cropError(1000, 200, 100), null);
+  assert.equal(cropError(1000, 0, 0), null);
+  assert.equal(cropError(0, 50, 50), null); // unknown height: nothing to check
+  assert.match(String(cropError(1000, 600, 600)), /melebihi tinggi halaman \(1000px\)/);
+  assert.equal(cropError(1000, -5, 0), "Nilai potongan harus angka ≥ 0.");
+  assert.equal(cropError(1000, Number.NaN, 0), "Nilai potongan harus angka ≥ 0.");
 });
 
 test("comic memory endpoints are isolated and validate missing comics", async () => {

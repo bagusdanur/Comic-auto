@@ -20,7 +20,7 @@ class WorkerResumeTests(unittest.TestCase):
             database=Mock();database.execute.return_value.fetchone.return_value={'status':'COMPLETED','output_path':str(output)}
             job={'id':'test','input_path':str(original),'output_path':str(jobroot/'chapter.zip'),'options':{'batch':True,'input_files':['001.png']}}
             before=output.read_bytes()
-            with patch('queue_worker.subprocess.Popen') as run,patch('queue_worker.archive_webp') as archive,patch('builtins.print'):
+            with patch('queue_worker.subprocess.Popen') as run,patch('queue_worker.archive_webp') as archive,patch('queue_worker.load_crops',return_value={}),patch('builtins.print'):
                 process_job(database,job,root,resume=True)
             run.assert_not_called();archive.assert_called_once()
             self.assertEqual(before,output.read_bytes())

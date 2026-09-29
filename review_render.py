@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import zipfile
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from webp_archive import archive_webp, page_webp_members
+from queue_db import load_crops
+from webp_archive import archive_webp, crop_page, page_webp_members
 
 from typeset_test import fit_text
 
@@ -34,9 +36,9 @@ def bounded_box(raw: dict, image: Image.Image) -> tuple[int, int, int, int]:
     return x, y, width, height
 
 
-def preview(source: Path, destination: Path, max_width: int) -> None:
+def preview(source: Path, destination: Path, max_width: int, crop_top: int = 0, crop_bottom: int = 0) -> None:
     with Image.open(source) as opened:
-        image = opened.convert("RGB")
+        image = crop_page(opened.convert("RGB"), crop_top, crop_bottom)
         width = min(max_width, image.width)
         height = max(1, round(image.height * width / image.width))
         image.thumbnail((width, height), Image.Resampling.LANCZOS)
@@ -109,19 +111,42 @@ def render(args: argparse.Namespace) -> None:
     os.replace(temporary, args.output)
 
 
-def archive(source: Path, destination: Path) -> None:
-    archive_webp(list(source.glob("*.png")), destination)
+def archive(source: Path, destination: Path, database: Path | None = None) -> None:
+    """Build the chapter WebP archive, honouring per-page crops when given a DB.
+
+    The review masters on disk are never trimmed; a page whose `crop_top` /
+    `crop_bottom` is set in the database is cut only here, so the delivered ZIP
+    matches what the operator sees in the editor.
+    """
+    images = list(source.glob("*.png"))
+    crops: dict[str, tuple[int, int]] = {}
+    if database is not None:
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        try:
+            crops = load_crops(connection, images)
+        finally:
+            connection.close()
+    archive_webp(images, destination, crops=crops)
 
 
-def page_file(source: Path, directory: Path) -> Path:
+def page_file(
+    source: Path,
+    directory: Path,
+    crop_top: int = 0,
+    crop_bottom: int = 0,
+) -> Path:
     """Write ONE page into `directory` and return the file that was written.
 
     The extension is decided here because only this side knows whether the page
     is taller than the archive split: a short page becomes `<stem>.webp`, a tall
     one becomes `<stem>.zip` holding the `_partNN.webp` members the chapter ZIP
     uses. The caller receives the concrete path so it never has to guess.
+
+    `crop_top` / `crop_bottom` trim the page before it is written, so a page
+    download carries the same trimmed result as the chapter archive.
     """
-    members = page_webp_members(source)
+    members = page_webp_members(source, crop_top=crop_top, crop_bottom=crop_bottom)
     directory.mkdir(parents=True, exist_ok=True)
     if len(members) == 1:
         target = directory / f"{source.stem}.webp"
@@ -141,6 +166,8 @@ def main() -> int:
     make_preview.add_argument("source", type=Path)
     make_preview.add_argument("destination", type=Path)
     make_preview.add_argument("--max-width", type=int, default=420)
+    make_preview.add_argument("--crop-top", type=int, default=0)
+    make_preview.add_argument("--crop-bottom", type=int, default=0)
     rerender = commands.add_parser("render")
     rerender.add_argument("cleaned", type=Path)
     rerender.add_argument("current", type=Path)
@@ -158,16 +185,19 @@ def main() -> int:
     make_archive = commands.add_parser("archive")
     make_archive.add_argument("source", type=Path)
     make_archive.add_argument("destination", type=Path)
+    make_archive.add_argument("--db", type=Path, default=None)
     make_page = commands.add_parser("page")
     make_page.add_argument("source", type=Path)
     make_page.add_argument("directory", type=Path)
+    make_page.add_argument("--crop-top", type=int, default=0)
+    make_page.add_argument("--crop-bottom", type=int, default=0)
     args = parser.parse_args()
     if args.command == "preview":
-        preview(args.source, args.destination, args.max_width)
+        preview(args.source, args.destination, args.max_width, args.crop_top, args.crop_bottom)
     elif args.command == "archive":
-        archive(args.source, args.destination)
+        archive(args.source, args.destination, args.db)
     elif args.command == "page":
-        print(page_file(args.source, args.directory))
+        print(page_file(args.source, args.directory, args.crop_top, args.crop_bottom))
     else:
         render(args)
     return 0
