@@ -60,6 +60,27 @@ export function jobDownloadFilename(row: SqlRow): string {
   return `${title}-ch-${folderSlug(rawChapter, "1")}${suffix}`;
 }
 
+/**
+ * Reduce a stage subprocess failure to the one line that explains it.
+ *
+ * `execFile` rejects with `Command failed: <cmd>\n<stderr>`, so surfacing
+ * `error.message` verbatim puts the whole command line and a Python traceback
+ * into the dashboard toast. The pipeline raises its real reason as the last
+ * `ValueError: ...` line, which is what the operator needs to act on.
+ */
+export function stageErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const lines = raw.split("\n").map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const match = /^(?:\w*Error|Exception):\s*(.+)$/.exec(lines[index] ?? "");
+    const reason = match?.[1]?.trim();
+    if (reason) return reason;
+  }
+  const last = lines.at(-1) ?? "";
+  if (last.startsWith("Command failed:")) return "Render gagal dijalankan.";
+  return last || "Render gagal.";
+}
+
 function requireToken(request: { headers: Record<string, unknown> }): boolean {
   const expected = process.env.TRANSLATOR_API_TOKEN;
   if (!expected) return true;
@@ -635,7 +656,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       return { imageId, regionId: body.regionId, status: "TYPESET", reviewCount };
     } catch (error) {
       request.log.warn(error);
-      return reply.code(409).send({ error: error instanceof Error ? error.message : "Render failed" });
+      return reply.code(409).send({ error: stageErrorMessage(error) });
     }
   });
   app.get("/api/jobs/:jobId/download", async (request, reply) => {

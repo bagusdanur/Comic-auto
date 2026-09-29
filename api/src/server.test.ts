@@ -1,6 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildApp, jobDownloadFilename } from "./server.js";
+import { buildApp, jobDownloadFilename, stageErrorMessage } from "./server.js";
+
+test("stage error message surfaces the pipeline reason, not the command", () => {
+  // What execFile actually rejects with: the command line, a Python traceback
+  // and the real ValueError at the end.
+  const failure = new Error([
+    "Command failed: /home/ryukomik/ryukomik-auto-comic-translator/.venv/bin/python review_render.py render a.png b.png c.png --bbox {...}",
+    "Traceback (most recent call last):",
+    '  File "review_render.py", line 73, in render',
+    "    raise ValueError(",
+    "ValueError: Teks tidak muat di kotak 60x24 bahkan pada font 17px. Perbesar kotak (Width/Height) atau pendekkan terjemahannya.",
+    "",
+  ].join("\n"));
+  assert.equal(
+    stageErrorMessage(failure),
+    "Teks tidak muat di kotak 60x24 bahkan pada font 17px. Perbesar kotak (Width/Height) atau pendekkan terjemahannya.",
+  );
+  // A traceback without a recognisable exception must not leak the command line.
+  assert.equal(stageErrorMessage(new Error("Command failed: python x.py")), "Render gagal dijalankan.");
+  assert.equal(stageErrorMessage(new Error("")), "Render gagal.");
+  assert.equal(stageErrorMessage(undefined), "Render gagal.");
+});
 
 test("download filename uses comic title and chapter", () => {
   assert.equal(jobDownloadFilename({

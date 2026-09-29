@@ -16,6 +16,14 @@ from webp_archive import archive_webp
 from typeset_test import fit_text
 
 
+# Floor for the editor's shrink-to-fit. Mirrors the production typesetter's
+# `fit_minimum` (typeset_test.py) so a hand-edited bubble cannot end up with
+# smaller text than the pipeline itself would ever emit. `MINIMUM_SCALE_RATIO`
+# is the same 0.52 default as `--min-scale-ratio`.
+MINIMUM_FONT_SIZE = 14
+MINIMUM_SCALE_RATIO = 0.52
+
+
 def bounded_box(raw: dict, image: Image.Image) -> tuple[int, int, int, int]:
     x = max(0, int(raw["x"]))
     y = max(0, int(raw["y"]))
@@ -65,12 +73,22 @@ def render(args: argparse.Namespace) -> None:
     inner_width = max(1, width - margin * 2)
     inner_height = max(1, height - margin * 2)
     draw = ImageDraw.Draw(output)
+    # Shrink to fit instead of refusing. The production typesetter already lets a
+    # translation borrow a smaller face (`fit_minimum`) when the preferred size
+    # does not fit, but this editor asked `fit_text` for exactly one size
+    # (minimum == maximum), so any edit that did not fit at the chosen size was
+    # rejected — the edit saved as status EDITED and the page never re-rendered.
+    fit_minimum = max(MINIMUM_FONT_SIZE, round(args.font_size * MINIMUM_SCALE_RATIO))
     fitted = fit_text(
         draw, args.translation.upper(), args.font, inner_width, inner_height,
-        args.font_size, args.font_size, args.line_spacing, args.stroke_width,
+        fit_minimum, args.font_size, args.line_spacing, args.stroke_width,
     )
     if not fitted:
-        raise ValueError("Translation does not fit with the selected font size")
+        raise ValueError(
+            f"Teks tidak muat di kotak {width}x{height} bahkan pada font "
+            f"{fit_minimum}px. Perbesar kotak (Width/Height) atau pendekkan "
+            "terjemahannya."
+        )
     text_bbox = fitted["text_bbox"]
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]
