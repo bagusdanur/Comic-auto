@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     progress REAL NOT NULL DEFAULT 0,
     review_count INTEGER NOT NULL DEFAULT 0,
     error TEXT,
+    -- Manual queue order. Defaults to created_at (see connect()), so a fresh
+    -- install keeps plain FIFO; dragging a row in the dashboard only rewrites
+    -- the positions it needs to. claim_next() sorts on this column first.
+    queue_position REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     started_at REAL,
@@ -131,6 +135,20 @@ def connect(path: Path) -> sqlite3.Connection:
         database.execute("ALTER TABLE images ADD COLUMN crop_bottom INTEGER NOT NULL DEFAULT 0")
     if "crop_updated_at" not in image_columns:
         database.execute("ALTER TABLE images ADD COLUMN crop_updated_at REAL NOT NULL DEFAULT 0")
+    job_columns = {row[1] for row in database.execute("PRAGMA table_info(jobs)")}
+    if "queue_position" not in job_columns:
+        database.execute("ALTER TABLE jobs ADD COLUMN queue_position REAL")
+    # Backfill so every existing row has a position. created_at doubles as the
+    # initial order, which is exactly the FIFO the worker used before this
+    # column existed, so nothing already queued jumps ahead of anything else.
+    database.execute(
+        "UPDATE jobs SET queue_position=created_at "
+        "WHERE queue_position IS NULL"
+    )
+    database.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_queue_position "
+        "ON jobs(status, queue_position, created_at)"
+    )
     now = time.time()
     defaults = {
         "concurrency": "1", "minimum_free_ram_mb": "2000",
@@ -193,7 +211,8 @@ def claim_next(database: sqlite3.Connection, available_ram_mb: int, minimum_ram_
             database.commit()
             return None
         waiting = database.execute(
-            "SELECT id FROM jobs WHERE status IN ('QUEUED','WAITING_RESOURCE') ORDER BY created_at LIMIT 1"
+            "SELECT id FROM jobs WHERE status IN ('QUEUED','WAITING_RESOURCE') "
+            "ORDER BY COALESCE(queue_position, created_at), created_at LIMIT 1"
         ).fetchone()
         if not waiting:
             database.commit()

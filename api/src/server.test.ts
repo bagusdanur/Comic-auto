@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildApp, cropError, jobDownloadFilename, stageErrorMessage } from "./server.js";
+import { buildApp, cropError, jobDownloadFilename, reorderQueue, stageErrorMessage } from "./server.js";
 
 test("stage error message surfaces the pipeline reason, not the command", () => {
   // What execFile actually rejects with: the command line, a Python traceback
@@ -72,5 +72,52 @@ test("comic memory endpoints are isolated and validate missing comics", async ()
   assert.equal((await app.inject({ method: "GET", url: "/api/comics/missing/memory" })).statusCode, 404);
   assert.equal((await app.inject({ method: "POST", url: "/api/comics/missing/memory/analyze" })).statusCode, 404);
   assert.equal((await app.inject({ method: "DELETE", url: "/api/comics/missing/memory/references/missing" })).statusCode, 404);
+  await app.close();
+});
+
+test("reorderQueue moves one job and renumbers the whole queue", () => {
+  const queue = [
+    { id: "a", position: 0 },
+    { id: "b", position: 1 },
+    { id: "c", position: 2 },
+  ];
+  // "up" swaps with the neighbour; positions are rewritten 0..n-1 so the worker
+  // (which always takes the smallest) sees the new order immediately.
+  assert.deepEqual(reorderQueue(queue, "b", "up"), [
+    { id: "b", position: 0 },
+    { id: "a", position: 1 },
+    { id: "c", position: 2 },
+  ]);
+  assert.deepEqual(reorderQueue(queue, "a", "down"), [
+    { id: "b", position: 0 },
+    { id: "a", position: 1 },
+    { id: "c", position: 2 },
+  ]);
+  // "top" jumps the whole queue, which is the one-tap action on mobile.
+  assert.deepEqual(reorderQueue(queue, "c", "top"), [
+    { id: "c", position: 0 },
+    { id: "a", position: 1 },
+    { id: "b", position: 2 },
+  ]);
+});
+
+test("reorderQueue clamps at the ends and ignores unknown jobs", () => {
+  const queue = [
+    { id: "a", position: 0 },
+    { id: "b", position: 1 },
+  ];
+  // Moving the first row up (or the last down) is a no-op, never an error.
+  assert.deepEqual(reorderQueue(queue, "a", "up"), queue);
+  assert.deepEqual(reorderQueue(queue, "b", "down"), queue);
+  assert.deepEqual(reorderQueue(queue, "a", "top"), queue);
+  assert.equal(reorderQueue(queue, "missing", "up"), null);
+  assert.equal(reorderQueue([], "a", "top"), null);
+});
+
+test("queue reorder endpoint validates the job and the move", async () => {
+  const app = await buildApp();
+  assert.equal((await app.inject({ method: "POST", url: "/api/jobs/missing/queue", payload: { move: "up" } })).statusCode, 404);
+  assert.equal((await app.inject({ method: "POST", url: "/api/jobs/missing/queue", payload: { move: "sideways" } })).statusCode, 400);
+  assert.equal((await app.inject({ method: "POST", url: "/api/jobs/missing/queue", payload: {} })).statusCode, 400);
   await app.close();
 });

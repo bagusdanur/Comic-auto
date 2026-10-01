@@ -36,6 +36,31 @@ function parseJob(row: SqlRow | undefined): SqlRow | undefined {
   return result;
 }
 
+export type QueueMove = "up" | "down" | "top";
+
+/**
+ * Apply one manual reorder to the waiting queue.
+ *
+ * Only the relative order of the pending jobs matters: the worker always takes
+ * the smallest `queue_position`, so the returned list is renumbered 0..n-1 in
+ * the requested order. A pure function so the button behaviour is unit-tested
+ * without a live database. Returns null when the job is not in the queue.
+ */
+export function reorderQueue(
+  entries: Array<{ id: string; position: number }>,
+  jobId: string,
+  move: QueueMove,
+): Array<{ id: string; position: number }> | null {
+  const index = entries.findIndex((entry) => entry.id === jobId);
+  if (index < 0) return null;
+  const next = entries.slice();
+  const [row] = next.splice(index, 1);
+  if (!row) return null;
+  const target = move === "top" ? 0 : move === "up" ? Math.max(0, index - 1) : Math.min(next.length, index + 1);
+  next.splice(target, 0, row);
+  return next.map((entry, order) => ({ id: entry.id, position: order }));
+}
+
 function openDatabase(): DatabaseSync {
   const database = new DatabaseSync(databasePath);
   database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;");
@@ -455,6 +480,50 @@ export async function buildApp(): Promise<FastifyInstance> {
     ).run(now, now, jobId);
     if (result.changes !== 1) return reply.code(409).send({ error: "Job is missing or can no longer be stopped" });
     return { id: jobId, status: "CANCELLED" };
+  });
+  // Manual queue order. The worker picks the smallest queue_position among the
+  // waiting jobs, so a reorder simply rewrites those positions. Only QUEUED and
+  // WAITING_RESOURCE are movable: a PROCESSING job is already running and a
+  // finished one has no place in the queue.
+  app.post("/api/jobs/:jobId/queue", async (request, reply) => {
+    const { jobId } = request.params as { jobId: string };
+    const move = (request.body as { move?: string } | undefined)?.move;
+    if (move !== "up" && move !== "down" && move !== "top") {
+      return reply.code(400).send({ error: "move harus 'up', 'down', atau 'top'" });
+    }
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const target = database.prepare("SELECT status FROM jobs WHERE id=?").get(jobId) as SqlRow | undefined;
+      if (!target) {
+        database.exec("ROLLBACK");
+        return reply.code(404).send({ error: "Job not found" });
+      }
+      if (String(target.status) !== "QUEUED" && String(target.status) !== "WAITING_RESOURCE") {
+        database.exec("ROLLBACK");
+        return reply.code(409).send({ error: "Hanya job yang masih menunggu bisa diatur urutannya" });
+      }
+      const entries = database.prepare(
+        "SELECT id FROM jobs WHERE status IN ('QUEUED','WAITING_RESOURCE') " +
+        "ORDER BY COALESCE(queue_position, created_at), created_at"
+      ).all() as SqlRow[];
+      const ordered = reorderQueue(
+        entries.map((row, index) => ({ id: String(row.id), position: index })),
+        jobId,
+        move,
+      );
+      if (!ordered) {
+        database.exec("ROLLBACK");
+        return reply.code(404).send({ error: "Job not found" });
+      }
+      const update = database.prepare("UPDATE jobs SET queue_position=?, updated_at=? WHERE id=?");
+      const now = Date.now() / 1000;
+      for (const entry of ordered) update.run(entry.position, now, entry.id);
+      database.exec("COMMIT");
+      return { id: jobId, move, queue: ordered };
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
   });
   // Deleting a comic or a chapter is permanent: the row, every child row
   // (chapters, jobs, images, regions, memory) and the whole directory tree are

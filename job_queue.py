@@ -147,10 +147,10 @@ def main() -> int:
         }
         now = time.time()
         database.execute(
-            "INSERT INTO jobs(id,status,input_path,output_path,requested_output_path,options_json,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(id,status,input_path,output_path,requested_output_path,options_json,created_at,updated_at,queue_position) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (job_id, "QUEUED", str(stored_input), str(stored_output),
-             str(requested_output) if requested_output else None, json.dumps(options), now, now),
+             str(requested_output) if requested_output else None, json.dumps(options), now, now, now),
         )
         database.commit()
         print(json.dumps(row_dict(database.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()), indent=2))
