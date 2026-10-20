@@ -415,6 +415,36 @@ def reconstruct_dense_caption(image: np.ndarray, bbox: dict) -> tuple[np.ndarray
     return result, mask
 
 
+def tied_to_erased(region, grouped_ids, by_id, min_area=400, min_height=12):
+    """True when a letter-less orphan is tightly stacked with a line being erased.
+
+    ``is_noise`` rejects anything without a latin letter, so a chat line OCR
+    reads back as digits ("21" standing for "IT.") never reaches a group -- and
+    the letters<3 speck guard used to keep it out of this orphan pass too. It
+    therefore passed through both stages: ungrouped, unerased, its raw glyphs
+    survived onto the finished page. Such a line is only let through when it
+    shares a column with a line that IS being erased (the inpaint is already
+    happening on that bubble) and is big enough not to be an invisible speck.
+    """
+    box = region["bbox"]
+    if int(box["width"]) * int(box["height"]) < min_area or int(box["height"]) < min_height:
+        return False
+    for rid in grouped_ids:
+        other = by_id.get(rid)
+        if not other:
+            continue
+        cand = other["bbox"]
+        left = max(box["x"], cand["x"])
+        right = min(box["x"] + box["width"], cand["x"] + cand["width"])
+        overlap = max(0, right - left) / max(1, min(box["width"], cand["width"]))
+        gap = max(box["y"] - (cand["y"] + cand["height"]),
+                  cand["y"] - (box["y"] + box["height"]), 0)
+        span = min(int(box["height"]), int(cand["height"]))
+        if overlap >= 0.60 and gap <= max(24, round(span * .25)):
+            return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", type=Path)
@@ -928,8 +958,11 @@ def main() -> int:
             continue
         text = str(region.get("text", ""))
         # Skip real junk specks; they are invisible and may sit on artwork.
+        # Letter-less lines are exempt only when they sit on a bubble whose
+        # text is already being erased -- see tied_to_erased.
         if len(re.sub(r"[^a-z]", "", text, flags=re.I)) < 3:
-            continue
+            if not tied_to_erased(region, grouped_region_ids, by_id):
+                continue
         if not is_noise(text):
             continue
         # A short source mark ("QI SCANS", "QIMANGA.COM") belongs to the

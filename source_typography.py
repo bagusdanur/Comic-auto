@@ -63,3 +63,50 @@ def select_font(args, typography):
     # with one regular face so merged/overlapping bubbles never mix fonts.
     del typography
     return args.font_dialogue or args.font
+def italic_run_reconciliation(items, max_gap_factor=1.5):
+    """Samakan varian italic dalam satu alur bubble yang berdempetan.
+
+    Satu bubble tidak bisa diklasifikasi sendiri andal: gerbang slant menuntut
+    minimal empat garis Hough, sehingga potongan pendek ("AND I'VE", terukur
+    0.667) ditolak jadi roman padahal saudara yang membawa sisa kalimat yang
+    sama lolos dan tampil italic -- dua font di dalam satu kalimat.
+
+    Reopen hanya bila keduanya sebutir bukti: tetangga dalam alur yang sama
+    sudah italic DAN bubble ini sendiri terukur miring (skor >= 0.22). Bubble
+    tanpa ukuran sama sekali dibiarkan -- 35 dari 46 tetangga demikian memang
+    tegak, jadi mewarisi italic akan lebih sering salah daripada benar.
+    """
+    ITALIC_FAMILY = ("italic", "bold_italic")
+    order = sorted((i for i in items if i.get("bbox")),
+                   key=lambda i: (i["bbox"].get("y", 0), i["bbox"].get("x", 0)))
+    runs, current = [], []
+    for entry in order:
+        bbox = entry["bbox"]
+        if current:
+            prev = current[-1]["bbox"]
+            gap = bbox.get("y", 0) - (prev.get("y", 0) + prev.get("height", 0))
+            same = (gap <= max_gap_factor * max(prev.get("height", 1), 1)
+                    and entry.get("semantic_style") == current[-1].get("semantic_style")
+                    and entry.get("surface_type") == current[-1].get("surface_type"))
+            if not same:
+                runs.append(current)
+                current = []
+        current.append(entry)
+    if current:
+        runs.append(current)
+    promoted = []
+    for run in runs:
+        if not any(e.get("font_variant") in ITALIC_FAMILY for e in run):
+            continue
+        for entry in run:
+            if entry.get("font_variant") in ITALIC_FAMILY:
+                continue
+            if float(entry.get("raw_italic_score") or 0.0) < .22:
+                continue
+            entry["font_variant"] = "bold_italic" if entry.get("font_variant") == "bold" else "italic"
+            entry["style_source"] = "adjacent_italic_run"
+            entry["italic_run_promoted"] = True
+            promoted.append(entry.get("id"))
+    return promoted
+
+

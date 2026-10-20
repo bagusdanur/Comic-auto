@@ -83,27 +83,70 @@ NARRATION_WORDS = frozenset({
 CONFIDENT_LETTERING = 0.85
 
 
-def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
-    def trustworthy_region(region: dict) -> bool:
-        confidence = float(region.get("confidence", 0))
-        if confidence >= 0.75:
-            return True
-        # OCR often gives the second, highly stylised line in a large shout
-        # balloon a slightly lower score. Keep it when it is spatially tied to
-        # a reliable neighbouring line; otherwise the cleanup mask only clears
-        # half of the RAW sentence.
-        if confidence < 0.60 or len(re.sub(r"[^a-z]", "", region["text"], flags=re.I)) < 3:
-            return False
-        box = region["bbox"]
-        for other in regions:
-            if other is region or float(other.get("confidence", 0)) < 0.75:
+def _tie(box, candidate):
+    left = max(box["x"], candidate["x"])
+    right = min(box["x"] + box["width"], candidate["x"] + candidate["width"])
+    overlap = max(0, right - left) / max(1, min(box["width"], candidate["width"]))
+    gap = max(box["y"] - (candidate["y"] + candidate["height"]),
+              candidate["y"] - (box["y"] + box["height"]), 0)
+    return overlap, gap
+
+
+def trusted_region_ids(regions):
+    """Fixed-point trust so a whole RAW sentence is removed, not half of it.
+
+    A chat bubble runs four lines. The recogniser answers the stylised second
+    line at 0.36 ("SAAMAA Isn") and the last one at 0.49 read as digits ("21"),
+    while the line above reads 0.99. The old ``confidence < 0.60`` floor
+    returned False *before* the proximity rescue could run, so those lines were
+    never grouped, never removed, and the raw English stayed on the finished
+    page -- exactly the half-erased sentence that rescue was written to
+    prevent. Seeds are the reads the recogniser stood behind (>= 0.75); every
+    other line joins only when it is tightly stacked in the same column as an
+    already trusted one, so loose specks far from any reliable line still die
+    here rather than being translated.
+    """
+    trusted = set()
+    for region in regions:
+        if float(region.get("confidence", 0)) >= 0.75 and len(str(region.get("text", "")).strip()) > 1:
+            trusted.add(region.get("id"))
+    changed = True
+    while changed:
+        changed = False
+        for region in regions:
+            rid = region.get("id")
+            if rid in trusted:
                 continue
-            candidate = other["bbox"]
-            gap = max(box["y"] - (candidate["y"] + candidate["height"]),
-                      candidate["y"] - (box["y"] + box["height"]), 0)
-            if horizontal_overlap(box, candidate) >= 0.42 and gap <= max(45, round(min(box["height"], candidate["height"]) * .45)):
-                return True
-        return False
+            text = str(region.get("text", "")).strip()
+            if len(text) < 2:
+                continue
+            box = region["bbox"]
+            has_letters = len(re.sub(r"[^a-z]", "", text, flags=re.I)) >= 3
+            confidence = float(region.get("confidence", 0))
+            for other in regions:
+                if other.get("id") not in trusted:
+                    continue
+                candidate = other["bbox"]
+                overlap, gap = _tie(box, candidate)
+                span = min(box["height"], candidate["height"])
+                # The proven rescue (>= 0.60, >= 3 letters, loose proximity) is
+                # kept unchanged; the strong tier chains one tightly stacked
+                # line to the next, which is what carries a four-line run.
+                loose = (has_letters and confidence >= 0.60
+                         and overlap >= 0.42 and gap <= max(45, round(span * .45)))
+                strong = overlap >= 0.60 and gap <= max(24, round(span * .25))
+                if loose or strong:
+                    trusted.add(rid)
+                    changed = True
+                    break
+    return trusted
+
+
+def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
+    TRUSTED = trusted_region_ids(regions)
+
+    def trustworthy_region(region: dict) -> bool:
+        return region.get("id") in TRUSTED
 
     def short_emotional_dialogue(region: dict) -> bool:
         text = str(region.get("text", "")).strip()

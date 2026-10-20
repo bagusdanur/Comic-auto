@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 import numpy as np
-from source_typography import source_typography,select_font
+from source_typography import source_typography,select_font,italic_run_reconciliation
 
 
 class SourceTypographyTests(unittest.TestCase):
@@ -29,6 +29,52 @@ class SourceTypographyTests(unittest.TestCase):
     def test_bold_raw_signal_does_not_change_render_font(self):
         style={'semantic_style':'shout','font_variant':'bold'}
         self.assertEqual(select_font(self.args,style),'cc-roman')
+    @staticmethod
+    def _run(specs):
+        """specs: (y, font_variant, raw_italic_score, semantic_style)"""
+        return [{"id": f"g{y}", "bbox": {"x": 0, "y": y, "width": 60, "height": 40},
+                 "surface_type": "BUBBLE_FLAT", "semantic_style": semantic,
+                 "font_variant": variant, "raw_italic_score": score}
+                for y, variant, score, semantic in specs]
+
+    def test_gated_slant_joins_its_italic_neighbour(self):
+        # "AND I'VE" terukur 0.667 tapi ditolak gerbang 4 garis Hough; saudara
+        # sekalimat yang lolos sudah italic -> keduanya harus satu font.
+        items=self._run([(0,"regular",0.667,"dialogue"),(52,"italic",0.455,"dialogue")])
+        promoted=italic_run_reconciliation(items)
+        self.assertEqual(items[0]["font_variant"],"italic")
+        self.assertTrue(items[0]["italic_run_promoted"])
+        self.assertEqual(items[0]["style_source"],"adjacent_italic_run")
+        self.assertEqual(promoted,["g0"])
+
+    def test_bubble_without_any_slant_measurement_stays_roman(self):
+        # 35 dari 46 tetangga 'tanpa ukuran' memang tegak -> jangan diwarisi.
+        items=self._run([(0,"regular",0.0,"dialogue"),(52,"italic",0.455,"dialogue")])
+        promoted=italic_run_reconciliation(items)
+        self.assertEqual(items[0]["font_variant"],"regular")
+        self.assertNotIn("italic_run_promoted",items[0])
+        self.assertEqual(promoted,[])
+
+    def test_run_with_no_italic_anchor_is_left_alone(self):
+        items=self._run([(0,"regular",0.667,"dialogue"),(52,"regular",0.455,"dialogue")])
+        self.assertEqual(italic_run_reconciliation(items),[])
+        self.assertEqual([i["font_variant"] for i in items],["regular","regular"])
+
+    def test_neighbour_too_far_or_other_style_is_a_separate_run(self):
+        far=self._run([(0,"regular",0.667,"dialogue"),(400,"italic",0.455,"dialogue")])
+        other=self._run([(0,"regular",0.667,"dialogue"),(52,"italic",0.455,"narration")])
+        self.assertEqual(italic_run_reconciliation(far),[])
+        self.assertEqual(italic_run_reconciliation(other),[])
+        self.assertEqual(far[0]["font_variant"],"regular")
+        self.assertEqual(other[0]["font_variant"],"regular")
+
+    def test_bold_neighbour_keeps_its_weight(self):
+        items=self._run([(0,"bold",0.5,"dialogue"),(52,"italic",0.455,"dialogue")])
+        italic_run_reconciliation(items)
+        self.assertEqual(items[0]["font_variant"],"bold_italic")
+
+    def test_items_without_bbox_are_ignored(self):
+        self.assertEqual(italic_run_reconciliation([{"font_variant":"regular"}]),[])
 
 
 if __name__=='__main__':unittest.main()

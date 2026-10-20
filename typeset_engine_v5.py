@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from source_text_color import source_text_color
-from source_typography import source_typography,select_font
+from source_typography import source_typography,select_font,italic_run_reconciliation
 from enclosed_bubble import enclosed_bubble_mask
 from outside_comment import comment_candidates
 
@@ -324,6 +324,15 @@ def render_page(args):
     promo_regions=[r for r in promo_regions if retained_top<=r['bbox']['y']<retained_bottom]
     processed,promo_groups,promo_decisions=remove_promotions(reference,np.array(output),promo_regions,groups)
     output=Image.fromarray(processed)
+    # Measure every group's RAW typography up front: the italic verdict can only
+    # be reconciled across neighbouring bubbles before any font is chosen.
+    page_typography={}
+    for g in groups:
+        entry=source_typography(reference,cleaned_reference,g['bbox'],g.get('style','dialogue'))
+        entry['id']=g['id'];entry['bbox']=g['bbox']
+        entry['surface_type']=(surfaces.get(g['id'],{}) or {}).get('surface_type')
+        page_typography[g['id']]=entry
+    italic_run_reconciliation(list(page_typography.values()))
     results=[]
     for group in groups:
         surface=surfaces.get(group['id'],{})
@@ -375,7 +384,7 @@ def render_page(args):
         stroke=0 if flat else (1 if group.get('style')=='narration' else 2)
         style=source_text_color(reference,cleaned_reference,b)
         color=style['color']
-        typography=source_typography(reference,cleaned_reference,b,group.get('style','dialogue'))
+        typography=dict(page_typography.get(group['id']) or source_typography(reference,cleaned_reference,b,group.get('style','dialogue')))
         selected_font=select_font(args,typography)
         system_markers=sum(bool(__import__('re').search(pattern,group.get('text',''),__import__('re').I)) for pattern in (
             r'\bRANK\s*:',r'\bDESCRIPTION\s*:',r'\bMATERIAL\b',r'\bEQUIPMENT\b',r'\bSKILL\b'))

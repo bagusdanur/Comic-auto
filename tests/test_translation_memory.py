@@ -2,7 +2,7 @@ import json
 import unittest
 
 from translation_providers import TranslationProvider
-from translate_text_test import collapse_duplicated_sentence, group_dialogue, merge_vertical_fragments
+from translate_text_test import collapse_duplicated_sentence, group_dialogue, merge_vertical_fragments, trusted_region_ids
 
 
 class FakeMemoryProvider(TranslationProvider):
@@ -166,3 +166,78 @@ class TranslationMemoryTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class GroupTrustTests(unittest.TestCase):
+    """Baris bergaris rendah harus ikut terhapus bersama paragrafnya."""
+
+    @staticmethod
+    def row(identifier, text, confidence, y, x=192, width=289, height=47):
+        return {"id": identifier, "text": text, "confidence": confidence,
+                "bbox": {"x": x, "y": y, "width": width, "height": height}}
+
+    # Halaman asli: page-008, empat baris satu gelembung chat. OCR membaca baris
+    # 2 sebagai "SAAMAA Isn" (0.36) dan baris 4 sebagai "21" (0.49); floor 0.60
+    # lama menolak keduanya sebelum cek tetangga jalan, jadi "ALWAYS JUST" dan
+    # "IT." tersisa utuh di halaman jadi.
+    CHAT = [
+        {"id": "r1", "text": "AND I'VE", "confidence": 0.988,
+         "bbox": {"x": 236, "y": 7731, "width": 200, "height": 47}},
+        {"id": "r2", "text": "SAAMAA Isn", "confidence": 0.360,
+         "bbox": {"x": 187, "y": 7776, "width": 300, "height": 47}},
+        {"id": "r3", "text": "HLIM DN INd", "confidence": 0.698,
+         "bbox": {"x": 192, "y": 7822, "width": 289, "height": 47}},
+        {"id": "r4", "text": "21", "confidence": 0.491,
+         "bbox": {"x": 302, "y": 7870, "width": 64, "height": 44}},
+    ]
+
+    def test_low_confidence_lines_join_their_reliable_line(self):
+        groups = group_dialogue(self.CHAT, 0)
+        grouped = {rid for group in groups for rid in group["source_region_ids"]}
+        # r2 (0.36) dan r3 (0.70) kini ikut terjemahan. r4 ("21", bacaan OCR
+        # untuk "IT.") sengaja TIDAK ikut -- is_noise menolaknya dari semua
+        # grup supaya angka tak pernah diterjemahkan -- tapi wajib ikut
+        # terhapus oleh tahap removal (lihat tied_to_erased).
+        self.assertEqual(grouped, {"r1", "r2", "r3"})
+        self.assertEqual(len(groups), 1)
+
+    def test_letterless_run_ender_is_caught_by_the_removal_stage(self):
+        from remove_text_test import tied_to_erased
+
+        grouped = {"r1", "r2", "r3"}
+        by_id = {row["id"]: row for row in self.CHAT}
+        # menempel 1 px di bawah baris yang sedang dihapus -> ikut terhapus
+        self.assertTrue(tied_to_erased(self.CHAT[3], grouped, by_id))
+        # berdiri sendiri jauh dari paragraf mana pun -> tidak disentuh
+        far = {**self.CHAT[3], "bbox": {**self.CHAT[3]["bbox"], "y": 5000}}
+        self.assertFalse(tied_to_erased(far, grouped, by_id))
+        # terlalu kecil -> tetap dianggap speck
+        speck = {**self.CHAT[3], "bbox": {"x": 302, "y": 7870, "width": 20, "height": 8}}
+        self.assertFalse(tied_to_erased(speck, grouped, by_id))
+
+    def test_trusted_region_ids_marks_the_two_rejected_lines(self):
+        self.assertEqual(trusted_region_ids(self.CHAT), {"r1", "r2", "r3", "r4"})
+
+    def test_low_confidence_line_far_from_any_reliable_line_stays_out(self):
+        regions = [
+            self.row("near", "WE SHOULD GO NOW", 0.99, 100, x=300, width=320),
+            self.row("far", "SAAMAA Isn", 0.36, 2400, x=310, width=300),
+        ]
+        # baris andalan tetap dikelompokkan; baris jauh di bawah tidak
+        grouped = {rid for group in group_dialogue(regions, 0)
+                   for rid in group["source_region_ids"]}
+        self.assertEqual(grouped, {"near"})
+        self.assertEqual(trusted_region_ids(regions), {"near"})
+
+    def test_low_confidence_line_must_be_tightly_stacked(self):
+        regions = [
+            self.row("near", "WE SHOULD GO NOW", 0.99, 100, x=300, width=320),
+            self.row("loose", "SAAMAA Isn", 0.50, 260, x=305, width=310),
+        ]
+        trusted = trusted_region_ids(regions)
+        self.assertIn("near", trusted)
+        self.assertNotIn("loose", trusted)
+        grouped = {rid for group in group_dialogue(regions, 0)
+                   for rid in group["source_region_ids"]}
+        self.assertEqual(grouped, {"near"})
