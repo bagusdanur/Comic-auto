@@ -260,7 +260,11 @@ def validate(original_path: Path, cleaned_path: Path, output_path: Path, mask_pa
         checks = {"dimensions_ok": False}
     else:
         with Image.open(mask_path) as source:
-            removal_allowed = np.asarray(source.convert("L")) > 0
+            # Keep the undilated mask: it marks exactly the RAW glyph pixels the
+            # removal stage erased. Residual checks anchor on those pixels
+            # instead of guessing which pixels are lettering from brightness.
+            removal_glyphs = np.asarray(source.convert("L")) > 0
+            removal_allowed = removal_glyphs
         # Inpainting necessarily samples and blends background around the OCR
         # glyph mask. Permit that local context; otherwise a correctly removed
         # long promo line is misclassified as an artwork-sized foreign edit.
@@ -300,10 +304,20 @@ def validate(original_path: Path, cleaned_path: Path, output_path: Path, mask_pa
             raw_mask = polygon_mask(original.shape[:2], np.asarray(item.get("raw_polygon") or item["polygon"])) > 0
             median_rgb = item.get("stats", {}).get("median_rgb", [255, 255, 255])
             background_gray = float(np.mean(median_rgb))
-            # Foreground can be black lettering on a white bubble, white
-            # narration on black artwork, or saturated SFX. Treating every dark
-            # pixel as RAW text falsely flags unchanged black backgrounds.
-            raw_foreground = raw_mask & (np.abs(original_gray - background_gray) >= 45)
+            # Foreground must be the RAW lettering itself, not "pixels far from
+            # the surface median". On a dark bubble the median sits only ~24 gray
+            # levels from black lettering, so the real text falls below the 45
+            # threshold and is never measured, while untouched white artwork
+            # inside the same polygon sits ~176 away and is measured instead.
+            # Reporting untouched artwork as raw residual failed a chapter whose
+            # translation was already clean.
+            raw_foreground = raw_mask & removal_glyphs
+            if int(np.count_nonzero(raw_foreground)) < 12:
+                # The removal mask never covered this surface. Fall back to the
+                # median-distance test instead of skipping, so a genuine
+                # residual still fails rather than passing through an empty
+                # measurement.
+                raw_foreground = raw_mask & (np.abs(original_gray - background_gray) >= 45)
             if (item.get("source_credit") or item.get("source_equals_translation")
                     or item.get("id") in intentionally_preserved):
                 continue

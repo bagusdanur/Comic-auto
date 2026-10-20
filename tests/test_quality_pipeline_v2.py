@@ -92,6 +92,79 @@ class QualityPipelineV2Test(unittest.TestCase):
             self.assertEqual(report["status"], "PASS")
             self.assertTrue(report["checks"]["dimensions_ok"])
 
+    def _dark_bubble_fixture(self, root: Path, *, output_changes_text: bool,
+                             mask_covers_text: bool, bright_text: bool) -> Path:
+        """Gelap (bg 24) berisi teks + garis artwork putih di dalam poligon."""
+        original = np.full((240, 320, 3), 24, dtype=np.uint8)
+        original[60:110, 60:160] = 0 if not bright_text else 200      # teks
+        original[140:190, 200:260] = 220                              # artwork
+        cleaned = original.copy()
+        cleaned[60:110, 60:160] = 24                                  # REMOVAL
+        rendered = cleaned.copy()
+        if output_changes_text:
+            rendered[60:110, 60:160] = 120                            # terjemahan
+        else:
+            rendered[60:110, 60:160] = original[60:110, 60:160]       # sisa teks
+        mask = np.zeros((240, 320), dtype=np.uint8)
+        if mask_covers_text:
+            mask[60:110, 60:160] = 255
+        for name, value in (("original.png", original), ("cleaned.png", cleaned), ("rendered.png", rendered)):
+            Image.fromarray(value).save(root / name)
+        Image.fromarray(mask).save(root / "mask.png")
+        (root / "surface.json").write_text(json.dumps({
+            "ambiguous_count": 0,
+            "surfaces": [{
+                "id": "bubble-dark",
+                "surface_type": "CHAT_UI",
+                "polygon": [[40, 40], [280, 40], [280, 200], [40, 200]],
+                "raw_polygon": [[40, 40], [280, 40], [280, 200], [40, 200]],
+                "stats": {"median_rgb": [24, 24, 24]},
+            }],
+        }))
+        (root / "typeset-report.json").write_text(json.dumps({"results": [], "automatic_promotions": []}))
+        return root / "quality.json"
+
+    def test_dark_bubble_untouched_artwork_is_not_raw_residual(self):
+        # Regresi bug nyata: teks hitam di bubble gelap jatuh di bawah ambang
+        # |abu-24|>=45, sehingga garis artwork putih yang tak tersentuh yang
+        # terukur dan dianggap sisa teks. Terjemahan sudah bersih tetap FAIL.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = self._dark_bubble_fixture(
+                root, output_changes_text=True, mask_covers_text=True, bright_text=False,
+            )
+            report = validate(root / "original.png", root / "cleaned.png", root / "rendered.png",
+                              root / "mask.png", root / "surface.json", report_path)
+            self.assertEqual(report["checks"]["residual_candidates"], [])
+            self.assertNotIn("RAW_TEXT_RESIDUAL", report["review_reasons"])
+            self.assertEqual(report["status"], "PASS")
+
+    def test_real_raw_text_residual_still_fails(self):
+        # Gerbang tetap keras: kalau keluaran masih memperlihatkan piksel teks
+        # asli apa adanya, QC wajib tetap menolak.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = self._dark_bubble_fixture(
+                root, output_changes_text=False, mask_covers_text=True, bright_text=False,
+            )
+            report = validate(root / "original.png", root / "cleaned.png", root / "rendered.png",
+                              root / "mask.png", root / "surface.json", report_path)
+            self.assertIn("RAW_TEXT_RESIDUAL", report["review_reasons"])
+            self.assertEqual(report["status"], "FAIL")
+
+    def test_fallback_catches_residual_when_removal_mask_misses_surface(self):
+        # Bila mask removal tidak menutup permukaan ini, jangan dilewati: uji
+        # cadangan berbasis kecerahan wajib masih menangkap sisa teks.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = self._dark_bubble_fixture(
+                root, output_changes_text=False, mask_covers_text=False, bright_text=True,
+            )
+            report = validate(root / "original.png", root / "cleaned.png", root / "rendered.png",
+                              root / "mask.png", root / "surface.json", report_path)
+            self.assertIn("RAW_TEXT_RESIDUAL", report["review_reasons"])
+            self.assertEqual(report["status"], "FAIL")
+
 
 if __name__ == "__main__":
     unittest.main()
