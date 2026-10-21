@@ -1,7 +1,7 @@
 # HANDOFF — ryukomik-auto-comic-translator
 
-Ditulis 2026-10-21 dari kode repo + git + riwayat session, lalu **disinkronkan ulang 2026-10-21 09:30**
-terhadap `git status` dan hasil `pytest` yang benar-benar dijalankan. Bagian yang tidak bisa
+Ditulis 2026-10-21 dari kode repo + git + riwayat session, lalu **disinkronkan ulang 2026-10-21 09:54**
+terhadap `git status`, isi `data/translator.sqlite3`, dan hasil `pytest` yang benar-benar dijalankan. Bagian yang tidak bisa
 dibuktikan ada di §10 — jangan diisi tebakan.
 
 Catatan istilah: **semua perubahan belum di-commit di repo ini adalah WIP session ini** (fitur yang
@@ -123,7 +123,7 @@ dikembalikan karena tidak muat.
   yang dikunci per judul. Jangan menyimpulkan alignment dari urutan ZIP.
 - **Worker RAM 2400M** karena 1500M mematikan worker di tengah halaman 60k px (222 restart beruntun).
   `TRANSLATOR_MIN_FREE_RAM_MB=2200`, `concurrency=1`. Memory-worker cukup 1500M.
-- **Jangan `git add -A`.** Working tree berisi 47 entri (19 modified + 28 untracked) milik session ini;
+- **Jangan `git add -A`.** Working tree berisi 46 entri (19 modified + 27 untracked) milik session ini;
   commit harus per path eksplisit dan per topik.
 
 ## 5. Jebakan / known issues (semua pernah kejadian)
@@ -174,30 +174,45 @@ dikembalikan karena tidak muat.
     Cek `jobs.status`/`jobs.stage`: `WAITING_RESOURCE` + `WAITING_DISK` artinya `disk_budget.disk_check`
     menolak (bukan bug worker). Bebaskan disk atau naikkan batas; jangan paksa status ke QUEUED
     tanpa cek `disk_health` (`tools/ops/storage_health.py`).
+12. **DITERIMA apa adanya: sisa ~21 px teks agak ke atas di page-005** (mask growth berhenti ~42 px di
+    atas garis bubble; perbaikannya butuh deteksi kontur outline, bukan pelonggaran ambang).
+    Job `7cfe2ac0` sudah dinyatakan **SELESAI** oleh user (§6) — **dibiarkan oleh user, jangan diubah
+    tanpa perintah baru**.
 
-## 6. Status terakhir (2026-10-21 09:30 WIB)
+## 6. Status terakhir (2026-10-21 09:54 WIB)
 
-Terverifikasi dengan menjalankan perintah, bukan dari catatan session:
+Latar: handoff awal ditulis 09:30. Bagian di bawah ini **diverifikasi ulang 2026-10-21 09:54 WIB**
+dengan menjalankan perintah, bukan dari catatan session:
 
-- **Test suite**: `.venv/bin/python -m pytest tests -q` → **347 passed, 1 failed, 59 subtests, 23.65 s**.
+- **Job `7cfe2ac0` SELESAI** — dinyatakan selesai oleh **user**, bukan auto-QC. Diverifikasi 09:54 WIB
+  langsung dari `data/translator.sqlite3` (`.venv/bin/python`, bukan sqlite3 CLI):
+  `status=COMPLETED`, `stage=DONE`, `progress=1.0`, `error=NULL`,
+  `completed_at=2026-10-21 08:24:47 WIB`; tabel `images` → 15 baris `COMPLETED`.
+  Judul/path: `data/jobs/library/pyscho-apartment/chapter-1/7cfe2ac0-.../` (Pyscho Apartment ch1, 15 halaman).
+  Tally hasil tetap **155 `TYPESET` / 29 `PRESERVED` / 0 `UNFIT` / 0 review**.
+- **Test suite**: `.venv/bin/python -m pytest tests -q` → **347 passed, 1 failed, 59 subtests, 23.65 s**
+  (dijalankan saat handoff 09:30; tidak dijalankan ulang pada sinkronisasi ini).
   Yang gagal hanya `test_branding_v51` (lihat §5.7 — sudah merah di HEAD, bukan akibat WIP).
 - **Service**: 4 proses PM2 `online`; API `/api/system/status` → HTTP 200; sidecar `/health` → `ok`,
   `inpainter: lama-onnx`, `accelerator: CPU Multi-threaded`.
 - **Model translasi aktif** (dari DB, bukan kode): `settings.ninerouter_model = ag/gemini-3.8-flash-low`,
   fallback `ag/claude-sonnet-4-6,cbai/deepseek-v4.1-flash`.
-- **Selesai**: job `7cfe2ac0-5067-406b-8df1-30561f325297` (Pyscho Apartment ch1, 15 halaman) →
-  155 `TYPESET`, 29 `PRESERVED`, 0 `UNFIT`, 0 review.
 - **Selesai & ter-deploy**: perbaikan posisi teks + spacing + mask bubble page-005
   (font 27/5 baris → 32/6 baris); `output/005_005.png` dan ZIP sudah diperbarui; worker sudah di-restart.
-- **Belum**: render ulang 15 halaman penuh (baru page-001..005 yang dibandingkan; status per bubble
-  identik); sisa ~21 px teks masih agak ke atas di page-005.
+- **DIBATALKAN atas keputusan user**: render ulang 15 halaman penuh / page-006..015 untuk mengukur
+  efek mask growth. Job sudah SELESAI, jadi **jangan dijalankan** (lihat §8.2).
 - **Sengaja dimatikan, bukan bug**: logo/emblem branding yang sudah ada di halaman sumber
   dipertahankan (`PRESERVED`, mis. `DEFER_SOURCE_BRANDING`); promo/credit page di-passthrough
   (`SOURCE_PROMO_ONLY`).
 
-### 6.1 Semua perubahan belum di-commit (WIP session ini, 47 entri)
+### 6.1 Semua perubahan belum di-commit (WIP session ini, 46 entri)
 
-HEAD masih `5373dee` ("Bersihkan hanya huruf: mask tidak boleh memotong garis bubble").
+HEAD = commit docs-only sinkronisasi ini (`git log -1`; isinya **hanya** `docs/HANDOFF.md`). Sebelumnya
+`ab51e4d` ("docs: sinkronkan handoff dengan seluruh WIP (47 entri)"); basis **kode** masih `5373dee`
+("Bersihkan hanya huruf: mask tidak boleh memotong garis bubble") — belum ada commit kode sejak itu.
+`git status --porcelain` = **46 entri: 19 `M` + 27 `??`** (diukur 2026-10-21 09:54 WIB, sesudah commit
+docs ini; `docs/HANDOFF.md` sudah bersih, bukan bagian dari 46).
+
 Ukuran nyata per area (angka = baris berubah setelah CR/whitespace diabaikan):
 
 | Area | File | Isi |
@@ -215,7 +230,8 @@ Ukuran nyata per area (angka = baris berubah setelah CR/whitespace diabaikan):
 | Test diubah | `test_mask_center_anchor.py`, `test_source_text_color.py`, `test_source_typography.py`, `test_translation_memory.py`, `test_typeset_engine_v5.py` | 5 file |
 | Vendor | `vendor/xianscan` (submodule/isi berubah) | model & kode sidecar |
 
-`docs/HANDOFF.md` sendiri juga untracked — commit terpisah.
+`docs/HANDOFF.md` sudah ter-commit di `ab51e4d` (docs-only) — **tidak** lagi bagian dari 46 entri WIP.
+Commit sinkronisasi berikutnya juga docs-only, path eksplisit (`git commit -- docs/HANDOFF.md`).
 
 ## 7. Verifikasi cepat
 
@@ -262,6 +278,8 @@ jatuh ke OpenCV dan hasil inpainting-nya berbeda (lihat §5.8).
 
 ## 8. TODO berikutnya (prioritas)
 
+### 8.1 Aktif (masih menggantung)
+
 1. **Normalisasi line ending** pada 7 file yang jadi CRLF (`source_typography.py`, `source_text_color.py`,
    `translate_text_test.py`, `memory_trainer.py`, `tests/test_source_typography.py`,
    `tests/test_source_text_color.py`, `tests/test_typeset_engine_v5.py`) supaya diff turun dari
@@ -269,14 +287,20 @@ jatuh ke OpenCV dan hasil inpainting-nya berbeda (lihat §5.8).
 2. Commit WIP per topik dengan path eksplisit (contoh grup: mask/typeset → branding → OCR resident →
    translate texts → reference memory → storage/ops → API). Jangan `git add -A`.
 3. Perbaiki `ANCHOR` di `branding_v51.py` (§5.7) supaya `pytest` hijau — bug-nya sudah ada di HEAD.
-4. Render ulang penuh job `7cfe2ac0` (atau minimal page-006..015) untuk memastikan mask growth tidak
-   mengubah halaman lain.
-5. Sisa ~21 px teks masih agak ke atas di page-005 karena mask berhenti 42 px di atas garis; butuh
-   cara mendeteksi kontur outline, bukan melonggarkan ambang.
-6. 479 orphan OCR tanpa huruf berdiri sendiri — belum diputuskan.
-7. 727 grup `source == translation` — perlu keputusan tuning.
-8. Jalankan `python -m unittest` untuk 12 test baru + pastikan `tools/ops/storage_health.py` masuk cron
+4. 479 orphan OCR tanpa huruf berdiri sendiri — belum diputuskan.
+5. 727 grup `source == translation` — perlu keputusan tuning.
+6. Jalankan `python -m unittest` untuk 12 test baru + pastikan `tools/ops/storage_health.py` masuk cron
    kalau mau disk alert otomatis.
+
+### 8.2 Dibatalkan / diterima apa adanya (JANGAN dijalankan)
+
+- ~~Render ulang penuh job `7cfe2ac0` (atau minimal page-006..015) untuk memastikan mask growth tidak
+  mengubah halaman lain~~ → **DIBATALKAN atas keputusan user** (2026-10-21). Job `7cfe2ac0` sudah
+  dinyatakan **SELESAI** (§6), jadi pengukuran efek mask growth di halaman lain tidak diperlukan.
+  Jangan dijalankan.
+- ~~Sisa ~21 px teks masih agak ke atas di page-005 karena mask berhenti 42 px di atas garis; butuh
+  cara mendeteksi kontur outline, bukan melonggarkan ambang~~ → **DITERIMA apa adanya**, dipindah ke
+  §5.12. **Dibiarkan oleh user, jangan diubah tanpa perintah baru.**
 
 ## 9. File yang wajib dibuka dulu
 
@@ -296,14 +320,15 @@ Urutan baca yang paling cepat paham: `queue_worker.py` → `translate.py` → `t
 - `tools/ops/storage_health.py` **[UNTRACKED]**, `tools/ops/maintain_storage.py` **[UNTRACKED]**, `tools/ops/retain_deploy_backups.py` **[UNTRACKED]** — health & retensi disk/backup.
 - `tools/repair/rerender_job_typeset.py`, `tools/repair/requeue_job.py` — perbaikan job tanpa antre ulang manual.
 
-**[UNTRACKED]** = belum masuk git; kalau hilang harus ditulis ulang dari nol. Inventaris lengkap 47 entri ada di §6.1.
+**[UNTRACKED]** = belum masuk git; kalau hilang harus ditulis ulang dari nol. Inventaris lengkap 46 entri ada di §6.1.
 
 ## 10. Belum terverifikasi
 
 - Klaim "sidecar XianScan bocor RSS ~42 MB/hari" berasal dari catatan session; belum diukur ulang di sini.
 - Apakah `resident_ocr.py` benar-benar aktif di job produksi terakhir (butuh cek log `TRANSLATOR_OCR_SOCKET`).
   Yang terverifikasi hanya: default env `'1'` dan syarat `input > 1 file`.
-- Efek mask growth `enclosed_bubble.py` pada halaman 006–015 belum diukur (belum di-render ulang).
+- Efek mask growth `enclosed_bubble.py` pada halaman 006–015 tetap **tidak diukur** — render ulangnya
+  dibatalkan atas keputusan user (§8.2). Jangan dijadikan blocker; kalau butuh angka, minta perintah baru.
 - Perilaku akhir `reference_memory.py` / `memory_alignment.py` / `pronoun_policy.py` disimpulkan dari
   docstring + nama fungsi + test baru, belum diuji end-to-end ke job nyata.
 - `vendor/xianscan` berubah sebagai submodule/isi vendor; isi diff-nya belum ditelusuri baris per baris.
