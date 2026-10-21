@@ -130,6 +130,56 @@ def padded_group_box(regions: list[dict], image_shape: tuple[int, ...],
     return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
 
 
+def flat_glyph_fill_mask(image: np.ndarray, permitted: np.ndarray,
+                         source_regions: list[dict], grow: int = 4) -> np.ndarray:
+    """Batasi white-fill ke huruf, jangan pernah ke kotak persegi penuh.
+
+    ``verified_white_fill`` mengembalikan footprint persegi lalu mengisinya
+    dengan putih rata. Kalau baris terakhir menempel ke garis awan, tepi
+    persegi itu memotong outline dan meninggalkan kotak putih lurus yang
+    menembus bubble. Permukaannya sudah diverifikasi putih seragam, jadi
+    mengganti hurufnya saja (plus halo anti-alias) secara visual sama, dan
+    komponen tinta yang bukan huruf -- busur garis pembungkus jauh lebih
+    panjang dan tipis dari satu huruf -- tidak pernah ikut terhapus.
+    """
+    if not source_regions:
+        return permitted
+    ys, xs = np.where(permitted > 0)
+    if not len(xs):
+        return permitted
+    pad = 6
+    x0, x1 = max(0, int(xs.min()) - pad), min(image.shape[1], int(xs.max()) + pad + 1)
+    y0, y1 = max(0, int(ys.min()) - pad), min(image.shape[0], int(ys.max()) + pad + 1)
+    crop = image[y0:y1, x0:x1]
+    local = permitted[y0:y1, x0:x1]
+    ink = ((crop.min(axis=2) < 180) & (local > 0)).astype(np.uint8)
+    if not np.any(ink):
+        return permitted
+    line_height = max(
+        int(region["bbox"]["height"]) for region in source_regions if region.get("bbox")
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(ink)
+    glyphs = np.zeros(crop.shape[:2], np.uint8)
+    for index in range(1, count):
+        left, top, width, height, area = (int(v) for v in stats[index][:5])
+        if area < 4 or height > line_height * 1.35 or width > height * 2.6:
+            continue
+        points = cv2.findNonZero((labels == index).astype(np.uint8))
+        if points is None:
+            continue
+        _, (rect_w, rect_h), _ = cv2.minAreaRect(points)
+        long_side, short_side = max(rect_w, rect_h), max(1.0, min(rect_w, rect_h))
+        if long_side / short_side > 3.0 or short_side > line_height * 1.1:
+            continue
+        glyphs[labels == index] = 255
+    if not np.any(glyphs):
+        return permitted
+    glyphs = cv2.dilate(glyphs, np.ones((grow * 2 + 1, grow * 2 + 1), np.uint8))
+    keep = np.zeros(permitted.shape, np.uint8)
+    keep[y0:y1, x0:x1] = np.minimum(glyphs, local)
+    return keep
+
+
 def locally_flat_text_surface(image: np.ndarray, box: tuple[int, int, int, int]) -> bool:
     """Accept a bright low-chroma text patch even if the page-level map is uncertain."""
     x1, y1, x2, y2 = box
@@ -265,19 +315,38 @@ def region_mask(image: np.ndarray, bbox: dict) -> tuple[np.ndarray | None, dict]
     count, labels, component_stats, _ = cv2.connectedComponentsWithStats(dark, 8)
     glyphs = np.zeros_like(dark)
     crop_area = gray.shape[0] * gray.shape[1]
+    candidates: list[int] = []
     for label in range(1, count):
         area = int(component_stats[label, cv2.CC_STAT_AREA])
         component_x = int(component_stats[label, cv2.CC_STAT_LEFT])
         component_y = int(component_stats[label, cv2.CC_STAT_TOP])
         component_width = int(component_stats[label, cv2.CC_STAT_WIDTH])
         component_height = int(component_stats[label, cv2.CC_STAT_HEIGHT])
-        touches_edge = (component_x <= 1 or component_y <= 1
-                        or component_x + component_width >= crop.shape[1] - 1
-                        or component_y + component_height >= crop.shape[0] - 1)
+        # A curve of the bubble outline inside a tight OCR box is wide and
+        # short, unlike a letter: it reaches from one edge of the line to
+        # well past a couple of glyphs while staying far below cap height.
+        # Cleaning it leaves a hole in the outline, which reads as a flat
+        # white box cutting through the bubble.
         elongated_line = (component_width > max(14, component_height * 9)
                           or component_height > max(18, component_width * 12))
         if not elongated_line and 2 <= area <= crop_area * 0.22 \
                 and component_width < crop.shape[1] * 0.8 and component_height < crop.shape[0] * 0.9:
+            candidates.append(label)
+    if candidates:
+        widths = sorted(int(component_stats[label, cv2.CC_STAT_WIDTH]) for label in candidates)
+        heights = sorted(int(component_stats[label, cv2.CC_STAT_HEIGHT]) for label in candidates)
+        median_width = widths[len(widths) // 2]
+        median_height = heights[len(heights) // 2]
+        for label in candidates:
+            component_width = int(component_stats[label, cv2.CC_STAT_WIDTH])
+            component_height = int(component_stats[label, cv2.CC_STAT_HEIGHT])
+            squashed = (component_width > median_width * 2.2
+                        and component_height < median_height * 0.85)
+            if not squashed and (component_width > median_width * 1.6
+                                 and component_height < median_height * 0.7):
+                squashed = True
+            if squashed:
+                continue
             glyphs[labels == label] = 255
     glyphs = cv2.dilate(glyphs, np.ones((3, 3), np.uint8), iterations=2)
     # A hard inset is the final guard against painting across a bubble/panel
@@ -517,6 +586,28 @@ def main() -> int:
             source_regions = [by_id[r] for r in group["source_region_ids"] if r in by_id]
             if not source_regions:
                 raise RuntimeError(f"V5 missing source regions: {group['id']}")
+            from verified_flat_cleanup import verified_white_fill
+            flat = verified_white_fill(original, source_regions, surface)
+            if flat is not None:
+                permitted, fill, verification = flat
+                # Putih hanya untuk hurufnya: tepi persegi footprint pernah
+                # memotong garis awan (kotak clean yang menembus bubble).
+                permitted = flat_glyph_fill_mask(original, permitted, source_regions)
+                verification = dict(verification, glyph_only_mask=True)
+                before = output.copy()
+                output[permitted > 0] = fill
+                delta = np.any(output != before, axis=2)
+                if np.any(delta & (permitted == 0)):
+                    raise RuntimeError('Verified white cleanup changed pixels outside its mask')
+                allowed_mask |= np.where(delta, 255, 0).astype(np.uint8)
+                results.append({
+                    'id': group['id'], 'status': 'CLEANED',
+                    'surface_type': 'BUBBLE_FLAT',
+                    'removal_backend': 'v5-verified-white-fill',
+                    'inpaint_batches': 0, 'changed_pixels': int(np.count_nonzero(delta)),
+                    'outside_mask_changed_pixels': 0, 'flat_verification': verification,
+                })
+                continue
             # Structured RPG/system windows have a flat or translucent card
             # behind several labelled lines. Large generative rectangle masks
             # can leave long black streaks on these fields. Remove the actual
@@ -559,27 +650,16 @@ def main() -> int:
                     continue
             # Include outline/shadow pixels that dark-glyph detectors miss.
             # Inpaint the source footprints; never paint an opaque text card.
-            region_masks=[]
-            for region in source_regions:
-                box = region['bbox']
-                x,y,w,h = (int(box[k]) for k in ('x','y','width','height'))
-                pad = max(4, min(9, round(h * .16)))
-                one=np.zeros(original.shape[:2],dtype=np.uint8)
-                one[max(0,y-pad):min(original.shape[0],y+h+pad), max(0,x-pad):min(original.shape[1],x+w+pad)] = 255
-                region_masks.append(one)
             # The sidecar intentionally rejects masks above 20% of a page.
             # Dense lore/credit pages can contain many safe OCR line boxes;
             # pack those boxes into bounded requests instead of weakening the
             # sidecar limit or aborting the entire chapter.
-            batches=[];current=np.zeros(original.shape[:2],dtype=np.uint8)
-            for one in region_masks:
-                merged=cv2.bitwise_or(current,one)
-                if np.any(current) and float(np.mean(merged>0))>.18:
-                    batches.append(current);current=one
-                else:current=merged
-            if np.any(current):batches.append(current)
+            from footprint_masks import source_footprint_batches
+            batches = source_footprint_batches(original.shape, source_regions)
+            batch_count = 0
             total_changed=0
             for permitted in batches:
+                batch_count += 1
                 if float(np.mean(permitted>0))>.18:
                     raise RuntimeError(f"V5 individual source footprint is implausibly large: {group['id']}")
                 candidate = xianscan.inpaint_mask(output, permitted)
@@ -589,7 +669,7 @@ def main() -> int:
                 output = candidate
                 total_changed+=int(np.count_nonzero(delta))
                 allowed_mask |= np.where(delta, 255, 0).astype(np.uint8)
-            results.append({"id": group["id"], "status": "INPAINTED", "surface_type": surface.get('surface_type'), "removal_backend": "v5-source-footprint-lama-batched", "inpaint_batches":len(batches), "changed_pixels":total_changed, "outside_mask_changed_pixels": 0})
+            results.append({"id": group["id"], "status": "INPAINTED", "surface_type": surface.get('surface_type'), "removal_backend": "v5-source-footprint-lama-batched", "inpaint_batches":batch_count, "changed_pixels":total_changed, "outside_mask_changed_pixels": 0})
             continue
         surface_clip = None
         if surface and surface.get("polygon"):
@@ -1016,8 +1096,13 @@ def main() -> int:
         raise RuntimeError("Output dimensions differ from original")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(output).save(args.output, format="PNG", optimize=True)
+    # This is an intermediate image. Lossless level 3 avoids the expensive
+    # optimized PNG search; final delivery is encoded by the branding/archive stage.
+    Image.fromarray(output).save(args.output, format="PNG", optimize=False, compress_level=3)
     Image.fromarray(allowed_mask).save(args.mask, format="PNG", optimize=True)
+    sidecar_batches = sum(item.get("inpaint_batches", 0) for item in results
+                          if "lama" in item.get("removal_backend", "")
+                          or item.get("removal_backend") == "v5-orphan-promo-source-footprint")
     report = {
         "input_dimensions": [original.shape[1], original.shape[0]],
         "output_dimensions": [output.shape[1], output.shape[0]],
@@ -1028,8 +1113,9 @@ def main() -> int:
         "results": results,
         "hybrid": {
             "mode": args.hybrid_mode,
-            "lama_available": hybrid_runtime_available,
-            "inference_enabled": args.hybrid_mode == "on",
+            "lama_available": hybrid_runtime_available or sidecar_batches > 0,
+            "inference_enabled": args.hybrid_mode == "on" or sidecar_batches > 0,
+            "sidecar_inpaint_batches": sidecar_batches,
             "artwork_events": len(hybrid_events),
             "events": hybrid_events,
         },
