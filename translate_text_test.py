@@ -210,8 +210,9 @@ def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
     for region in sorted(clean, key=lambda item: float(item.get("confidence", 0)), reverse=True):
         box = region["bbox"]
         duplicate = False
+        duplicate_at = None
         normalized = re.sub(r"[^a-z0-9]", "", region["text"].casefold())
-        for kept in deduped:
+        for index, kept in enumerate(deduped):
             other = kept["bbox"]
             iw = max(0, min(box["x"] + box["width"], other["x"] + other["width"]) - max(box["x"], other["x"]))
             ih = max(0, min(box["y"] + box["height"], other["y"] + other["height"]) - max(box["y"], other["y"]))
@@ -219,9 +220,20 @@ def group_dialogue(regions: list[dict], minimum_y: int) -> list[dict]:
             other_text = re.sub(r"[^a-z0-9]", "", kept["text"].casefold())
             if overlap >= .72 and SequenceMatcher(None, normalized, other_text).ratio() >= .66:
                 duplicate = True
+                duplicate_at = index
                 break
         if not duplicate:
             deduped.append(region)
+            continue
+        # Satu kotak bisa memuat kotak lain: OCR kadang membaca potongan
+        # yang lebih yakin di dalam kotak penuh ("HAAAA" 150x183 di dalam
+        # "HAAH?????" 188x608). Menyimpan potongan membuat sisa huruf asli
+        # tidak pernah dihapus dan terjemahan hanya separuh kalimat, jadi
+        # kotak yang memuat menggantikan potongannya.
+        kept = deduped[duplicate_at]
+        kept_box = kept["bbox"]
+        if box["width"] * box["height"] > kept_box["width"] * kept_box["height"] * 1.25:
+            deduped[duplicate_at] = region
     clean = sorted(deduped, key=lambda item: (item["bbox"]["y"], item["bbox"]["x"]))
 
     groups: list[dict] = []

@@ -64,17 +64,26 @@ def select_font(args, typography):
     del typography
     return args.font_dialogue or args.font
 def italic_run_reconciliation(items, max_gap_factor=1.5):
-    """Samakan varian italic dalam satu alur bubble yang berdempetan.
+    """Samakan varian huruf dalam satu alur bubble yang berdempetan.
 
-    Satu bubble tidak bisa diklasifikasi sendiri andal: gerbang slant menuntut
-    minimal empat garis Hough, sehingga potongan pendek ("AND I'VE", terukur
-    0.667) ditolak jadi roman padahal saudara yang membawa sisa kalimat yang
-    sama lolos dan tampil italic -- dua font di dalam satu kalimat.
+    Satu bubble tidak bisa diklasifikasi sendiri andal. Dua masalah nyata:
 
-    Reopen hanya bila keduanya sebutir bukti: tetangga dalam alur yang sama
-    sudah italic DAN bubble ini sendiri terukur miring (skor >= 0.22). Bubble
-    tanpa ukuran sama sekali dibiarkan -- 35 dari 46 tetangga demikian memang
-    tegak, jadi mewarisi italic akan lebih sering salah daripada benar.
+    * Gerbang slant menuntut minimal empat garis Hough, sehingga potongan
+      pendek ("AND I'VE", terukur 0.667) ditolak jadi roman padahal saudara
+      sekalimat yang lolos tampil italic -- dua font di dalam satu kalimat.
+      Solusinya: bubble dibuka jadi italic hanya bila tetangga se-alur sudah
+      italic DAN bubble itu sendiri terukur miring (skor >= .22). Bubble tanpa
+      ukuran sama sekali dibiarkan; 35 dari 46 tetangga demikian memang tegak.
+
+    * Kalimat yang terpecah jadi beberapa bubble bisa jatuh di sisi berbeda
+      ambang bold, sehingga gelembung berdempetan memakai dua muka huruf
+      berbeda (regular lalu bold, atau bold lalu bold-italic). Sumbernya satu
+      muka huruf yang sama. Di sini varian diseragamkan per alur: mayoritas
+      ketat menang, alur tanpa italic seragam jadi regular, dan italic lemah
+      (skor < .45) di alur campur diturunkan karena buktinya tipis.
+
+    Se-alur = berdempetan vertikal (gap <= max_gap_factor x tinggi yang lebih
+    besar di antara keduanya), semantic_style sama, dan surface_type sama.
     """
     ITALIC_FAMILY = ("italic", "bold_italic")
     order = sorted((i for i in items if i.get("bbox")),
@@ -85,7 +94,10 @@ def italic_run_reconciliation(items, max_gap_factor=1.5):
         if current:
             prev = current[-1]["bbox"]
             gap = bbox.get("y", 0) - (prev.get("y", 0) + prev.get("height", 0))
-            same = (gap <= max_gap_factor * max(prev.get("height", 1), 1)
+            # Tinggi yang dipakai adalah yang lebih besar dari keduanya: satu
+            # baris pendek (mis. 32 px) tak boleh memutus alur kalimat utuh.
+            span = max(prev.get("height", 1), bbox.get("height", 1), 1)
+            same = (gap <= max_gap_factor * span
                     and entry.get("semantic_style") == current[-1].get("semantic_style")
                     and entry.get("surface_type") == current[-1].get("surface_type"))
             if not same:
@@ -94,19 +106,56 @@ def italic_run_reconciliation(items, max_gap_factor=1.5):
         current.append(entry)
     if current:
         runs.append(current)
-    promoted = []
+    touched = []
     for run in runs:
-        if not any(e.get("font_variant") in ITALIC_FAMILY for e in run):
-            continue
-        for entry in run:
-            if entry.get("font_variant") in ITALIC_FAMILY:
-                continue
-            if float(entry.get("raw_italic_score") or 0.0) < .22:
-                continue
-            entry["font_variant"] = "bold_italic" if entry.get("font_variant") == "bold" else "italic"
-            entry["style_source"] = "adjacent_italic_run"
-            entry["italic_run_promoted"] = True
-            promoted.append(entry.get("id"))
-    return promoted
+        variants = [e.get("font_variant") for e in run]
+
+        # 1) dorong tetangga yang punya bukti miring mengikuti saudara se-alur
+        if any(v in ITALIC_FAMILY for v in variants):
+            for entry in run:
+                if entry.get("font_variant") in ITALIC_FAMILY:
+                    continue
+                if float(entry.get("raw_italic_score") or 0.0) < .22:
+                    continue
+                entry["font_variant"] = "bold_italic" if entry.get("font_variant") == "bold" else "italic"
+                entry["style_source"] = "adjacent_italic_run"
+                entry["italic_run_promoted"] = True
+                touched.append(entry.get("id"))
+
+        # 2) turunkan italic lemah di alur yang campur
+        variants = [e.get("font_variant") for e in run]
+        if any(v in ITALIC_FAMILY for v in variants) and any(v not in ITALIC_FAMILY for v in variants):
+            italic_ones = [e for e in run if e.get("font_variant") in ITALIC_FAMILY]
+            weak = [e for e in italic_ones if float(e.get("raw_italic_score") or 0.0) < .45]
+            if weak and len(weak) == len(italic_ones):
+                for entry in weak:
+                    entry["font_variant"] = ("bold" if entry.get("font_variant") == "bold_italic"
+                                             else "regular")
+                    entry["style_source"] = "weak_italic_in_mixed_run"
+                    entry["italic_demoted"] = True
+                    touched.append(entry.get("id"))
+
+        # 3) bobot bold di alur tanpa italic. Sumber huruf yang sama bisa jatuh
+        #    di sisi ambang berbeda (2.32 vs 1.91), sehingga gelembung
+        #    berdempetan tampil dua muka. Bukti tebal kuat (>= 3.2) menang dan
+        #    alur dibiarkan; kalau tidak, seluruh alur ikut mayoritas.
+        variants = [e.get("font_variant") for e in run]
+        emphatic = any(v in ITALIC_FAMILY for v in variants)
+        bold_ones = [e for e in run if e.get("font_variant") in ("bold", "bold_italic")]
+        strong_bold = [e for e in bold_ones if float(e.get("raw_bold_score") or 0.0) >= 3.2]
+        target_bold = None
+        if not emphatic and not strong_bold:
+            target_bold = len(bold_ones) * 2 > len(run)
+        if target_bold is not None:
+            for entry in run:
+                italic_part = entry.get("font_variant") in ITALIC_FAMILY
+                wanted = (("bold_italic" if italic_part else "bold") if target_bold
+                          else ("italic" if italic_part else "regular"))
+                if wanted != entry.get("font_variant"):
+                    entry["font_variant"] = wanted
+                    entry["style_source"] = "uniform_run_weight"
+                    entry["run_variant_uniformed"] = True
+                    touched.append(entry.get("id"))
+    return touched
 
 

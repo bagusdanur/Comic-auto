@@ -111,6 +111,32 @@ def fit_text_v5(text, font_path, mask, minimum=22, maximum=36, stroke=0, _hyphen
     return None
 
 
+def fit_mask_center(text,font_path,mask,minimum=22,maximum=36,stroke=0,alignment='center'):
+    """Fit di tengah area aman, bukan di titik tengah glyph sumber.
+
+    Anchor dari glyph asli bisa jatuh di tepi mask: dasar gelembung sering
+    terpotong artwork atau label tetangga, sehingga blok teks tidak pernah muat
+    walau mask-nya lapang (pyscho ch1 page-005 bubble-002: anchor y=258.5 di
+    mask setinggi 268, jadi hanya ~10 px yang tersisa di bawahnya). Tengah bbox
+    piksel aman selalu berada di dalam area yang bisa dipakai. Hanya dipakai
+    setelah semua jalur normal gagal, jadi tata letak yang sudah pas tidak
+    bergeser.
+    """
+    ys,xs=np.where(mask>0)
+    if not len(xs):
+        return None
+    candidates=[((float(xs.min())+float(xs.max())+1)/2,(float(ys.min())+float(ys.max())+1)/2)]
+    centroid=(float(xs.mean()),float(ys.mean()))
+    if abs(centroid[0]-candidates[0][0])>2 or abs(centroid[1]-candidates[0][1])>2:
+        candidates.append(centroid)
+    for center in candidates:
+        fitted=fit_text_v5(text,font_path,mask,minimum,maximum,stroke,anchor_center=center,alignment=alignment)
+        if fitted:
+            fitted['fallback_reason']='MASK_CENTER_ANCHOR'
+            return fitted
+    return None
+
+
 def fit_constrained_text(text, font_path, mask, stroke=0, anchor_center=None, alignment='center'):
     """Last resort: readable floor, then a conservative syllable line break.
 
@@ -434,6 +460,24 @@ def render_page(args):
                 mask,anchor_center=fit_space(mask,anchor_center,box=bounds,footprint=b)
                 stroke=2
                 fitted=fit_text_v5(group['translation'],selected_font,mask,max(22,args.min_font_size),preferred,stroke,anchor_center=anchor_center)
+        if not fitted and not is_system_window:
+            # Anchor titik tengah glyph sumber bisa buntu di tepi area aman
+            # (dasar gelembung terpotong artwork/label tetangga), sehingga blok
+            # teks tidak pernah muat walau mask-nya lapang dan terjemahan lalu
+            # dibuang (PRESERVED/UNFIT_SOURCE_RESTORED -> teks Inggris balik).
+            # Tengah area aman selalu bisa dipakai, jadi coba di sana dulu
+            # sebelum menyerah ke lantai darurat.
+            for candidate_font in (selected_font,regular_font):
+                if candidate_font is not selected_font and str(candidate_font)==str(selected_font):
+                    continue
+                centered=fit_mask_center(group['translation'],candidate_font,mask,max(22,args.min_font_size),preferred,stroke,alignment)
+                if not centered:
+                    continue
+                fitted=centered
+                if str(candidate_font)!=str(selected_font):
+                    selected_font=candidate_font
+                    typography={**typography,'font_variant':'regular','style_source':'FIT_FALLBACK','style_confidence':1.0,'font_fallback_reason':'VARIANT_DOES_NOT_FIT'}
+                break
         if not fitted:
             # User-approved emergency floor for genuinely constrained text.
             # Reuse the same safe mask: never enlarge/ignore balloon boundaries.

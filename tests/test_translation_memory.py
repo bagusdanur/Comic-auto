@@ -241,3 +241,36 @@ class GroupTrustTests(unittest.TestCase):
         grouped = {rid for group in group_dialogue(regions, 0)
                    for rid in group["source_region_ids"]}
         self.assertEqual(grouped, {"near"})
+
+
+class DedupContainmentTests(unittest.TestCase):
+    """Kotak yang memuat potongan harus menang, walau conf-nya lebih rendah.
+
+    pyscho ch1 page-007: 'HAAH?????' (188x608, conf .814, seluruh huruf merah)
+    dan 'HAAAA' (150x183, conf .916, potongan di dalamnya). Dedup lama menyimpan
+    yang conf-nya lebih tinggi, jadi potongan yang jadi gelembung: terjemahan
+    hanya separuh kalimat dan huruf merah di luar kotak potongan tidak pernah
+    dihapus dari halaman jadi.
+    """
+
+    @staticmethod
+    def box(rid, text, confidence, x, y, width, height):
+        return {"id": rid, "text": text, "confidence": confidence,
+                "bbox": {"x": x, "y": y, "width": width, "height": height},
+                "polygon": [[x, y], [x + width, y], [x + width, y + height],
+                            [x, y + height]]}
+
+    def test_kotak_penuh_mengalahkan_potongan_yang_lebih_yakin(self):
+        full = self.box("full", "HAAH?????", 0.814, 260, 5600, 188, 608)
+        part = self.box("part", "HAAAA", 0.916, 286, 5617, 150, 183)
+        groups = group_dialogue([full, part], 0)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["source_region_ids"], ["full"])
+        self.assertEqual(groups[0]["text"], "HAAH?????")
+
+    def test_duplikat_seukuran_tetap_dibuang(self):
+        kept = self.box("kept", "HEY!!", 0.97, 200, 300, 220, 180)
+        damaged = self.box("damaged", "rEY!!", 0.90, 200, 300, 220, 180)
+        groups = group_dialogue([kept, damaged], 0)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["text"], "HEY!!")

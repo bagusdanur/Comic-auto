@@ -78,3 +78,54 @@ class SourceTypographyTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+
+class RunUniformityTests(unittest.TestCase):
+    """Satu alur bubble harus memakai satu muka huruf."""
+
+    @staticmethod
+    def run2(specs):
+        """specs: (y, font_variant, raw_italic_score, height) pada gaya sama."""
+        return [{"id": f"u{y}", "bbox": {"x": 0, "y": y, "width": 80, "height": h},
+                 "surface_type": "BUBBLE_FLAT", "semantic_style": "dialogue",
+                 "font_variant": variant, "raw_italic_score": score}
+                for y, variant, score, h in specs]
+
+    def test_regular_and_bold_neighbour_settle_on_one_face(self):
+        # page-007: "ILLEGAL DUMPING..." (regular) + "OR A FINE OF" (bold) --
+        # satu muka huruf di sumber, jatuh di sisi ambang bold yang berbeda.
+        items = self.run2([(0, "regular", 0.0, 40), (52, "bold", 0.0, 40)])
+        italic_run_reconciliation(items)
+        self.assertEqual([i["font_variant"] for i in items], ["regular", "regular"])
+        self.assertTrue(any("run_variant_uniformed" in i for i in items))
+
+    def test_strict_bold_majority_keeps_the_whole_run_bold(self):
+        items = self.run2([(0, "bold", 0.0, 40), (52, "bold", 0.0, 40), (104, "regular", 0.0, 40)])
+        italic_run_reconciliation(items)
+        self.assertEqual([i["font_variant"] for i in items], ["bold", "bold", "bold"])
+
+    def test_weak_italic_in_a_mixed_run_is_dropped(self):
+        # page-014: skor 0.222 terlalu tipis untuk mempertahankan miring.
+        items = self.run2([(0, "italic", 0.222, 40), (52, "regular", 0.0, 40)])
+        italic_run_reconciliation(items)
+        self.assertEqual([i["font_variant"] for i in items], ["regular", "regular"])
+
+    def test_strong_italic_is_left_alone_beside_a_roman_neighbour(self):
+        # bukti miring kuat tidak dihapus hanya karena tetangganya tegak
+        items = self.run2([(0, "italic", 0.5, 40), (52, "regular", 0.0, 40)])
+        touched = italic_run_reconciliation(items)
+        self.assertEqual([i["font_variant"] for i in items], ["italic", "regular"])
+        self.assertEqual(touched, [])
+
+    def test_a_short_line_still_joins_the_run_of_its_sentence(self):
+        # baris 32 px tak boleh memutus alur: toleransi pakai tinggi terbesar
+        items = self.run2([(0, "regular", 0.0, 32), (60, "bold", 0.0, 160)])
+        italic_run_reconciliation(items)
+        self.assertEqual([i["font_variant"] for i in items], ["regular", "regular"])
+
+    def test_emphasis_run_keeps_its_own_weights(self):
+        # alur yang sudah italic semua: bobot bold tiap anggota dipertahankan
+        items = self.run2([(0, "bold_italic", 0.5, 40), (52, "italic", 0.5, 40)])
+        italic_run_reconciliation(items)
+        self.assertEqual([i["font_variant"] for i in items], ["bold_italic", "italic"])
