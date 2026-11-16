@@ -791,13 +791,14 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
         inpaint=XianScanClient(os.getenv('XIANSCAN_URL','http://127.0.0.1:8123')).inpaint_mask
     output,emblem_decisions=clean_emblems(reference,output,protected,top,bottom,inpaint)
     report['decisions'].extend(emblem_decisions)
-    # VISUAL_PILL_OVERLAY (restored 2026-11-16): EvaScans' mid-chapter pill is
-    # pure artwork -- OCR yields no region for it, so the group loop above is
-    # blind to it. Detect it from the pixels and cover it with the brand logo
-    # directly: NO erase/inpaint (that left a visible blur block and the
-    # operator rejected it on 2026-11-12). Logo width = pill width (the
-    # operator's final sizing rule), capped at 62% of the page width, with
-    # the same protected-text collision guard as every other replacement.
+    # VISUAL_PILL (restored 2026-11-16): EvaScans' mid-chapter pill is pure
+    # artwork -- OCR yields no region for it, so the group loop above is
+    # blind to it. Detect it from the pixels, then treat it exactly like an
+    # OCR-anchored pill: erase the full capsule with the same dilated mask
+    # and the engine's LaMa inpaint, then stamp the brand logo (operator:
+    # "kok gak di-clean cuma ditimpa aja", 2026-11-16 -- the overlay-only
+    # variant from 2026-11-12 is superseded). Same protected-text collision
+    # guard as every other replacement.
     handled=[d['context'] for d in report['decisions'] if d.get('action') in ('REPLACED_PILL','REMOVED_SOURCE_TEXT') and d.get('context')]
     for vr in eva_graphic_pill_regions(reference):
         b=vr['bbox'];x1,y1=int(b['x']),int(b['y']);x2,y2=x1+int(b['width']),y1+int(b['height'])
@@ -813,9 +814,46 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
                 'context':[x1,y1,x2,y2],'protected_text':str(collision.get('text',collision.get('id'))),
                 'reason':'Visual pill intersects protected text; no overlay applied','mask_pixels':0,'outside_mask_changed_pixels':0})
             continue
-        target=min(x2-x1,round(w*.62))
+        # Erase the whole capsule first (same recipe as the group loop):
+        # dilated mask, full rect, LaMa repair from the pristine reference.
+        _k=max(5,round(w*.006))|1
+        vmask=np.zeros((h,w),np.uint8)
+        # The emblem disc pokes a few px beyond the measured pink bbox
+        # (fringe shades outside the strict signature); widen the erase
+        # rect so no pink sliver survives next to the stamp.
+        ex1,ey1=max(0,x1-round(w*.03)),max(0,y1-round(w*.02))
+        ex2,ey2=min(w,x2+round(w*.03)),min(h,y2+round(w*.02))
+        vmask[ey1:ey2,ex1:ex2]=255
+        vmask=cv2.dilate(vmask,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(_k,_k)))
+        vrepaired=None
+        try:
+            vrepaired=inpaint(reference,vmask)
+        except Exception as exc:
+            from requests.exceptions import HTTPError
+            response=getattr(exc,'response',None)
+            if isinstance(exc,HTTPError) and response is not None and response.status_code==400:
+                report['decisions'].append({'text':'EVASCANS.NET','action':'PRESERVED_REJECTED_SOURCE_MASK',
+                    'reason':response.text[:300],'mask_pixels':0,'outside_mask_changed_pixels':0})
+                continue
+            # Cleaning service unavailable (e.g. sidecar secret not shared
+            # with this worker): never crash the page and never leave the
+            # scanlator pill visible -- fall back to covering it directly
+            # with the logo, and say so in the decision record.
+            vrepaired=None
+        if vrepaired is not None:
+            if vrepaired.shape!=reference.shape or np.any(np.any(vrepaired!=reference,axis=2)&(vmask==0)):
+                raise RuntimeError('V5.2 visual pill inpainting changed pixels outside source mask')
+            output[vmask>0]=vrepaired[vmask>0]
+        bounds=(x1,y1,x2,y2)
+        target=min(round((x2-x1)*.92),round(w*.62))
         mark=logo.resize((target,max(1,round(logo.height*target/logo.width))),Image.Resampling.LANCZOS)
         pos=(cx-mark.width//2,cy-mark.height//2)
+        layout_details={}
+        if logo_layout is not None:
+            try:
+                mark,pos,layout_details=logo_layout(logo,bounds,vmask,output,protected)
+            except Exception:
+                pass  # layout helper must never abort the chapter; keep the plain stamp
         mx,my=pos
         sx1,sy1=max(0,mx),max(0,my);sx2,sy2=min(w,mx+mark.width),min(h,my+mark.height)
         if sx2>sx1 and sy2>sy1:
@@ -823,8 +861,9 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
             window=Image.fromarray(output[sy1:sy2,sx1:sx2]).convert('RGBA')
             window.alpha_composite(patch,(0,0))
             output[sy1:sy2,sx1:sx2]=np.array(window.convert('RGB'))
-        report['decisions'].append({'text':'EVASCANS.NET','action':'REPLACED_VISUAL_PILL','context':[x1,y1,x2,y2],'mask_pixels':0,'outside_mask_changed_pixels':0})
-        report['replacements'].append({'logo':[pos[0],pos[1]-top,mark.width,mark.height],'mode':'VISUAL_PILL_OVERLAY'})
+        _cleaned=vrepaired is not None
+        report['decisions'].append({'text':'EVASCANS.NET','action':'REPLACED_VISUAL_PILL' if _cleaned else 'REPLACED_VISUAL_PILL_OVERLAY_FALLBACK','context':[x1,y1,x2,y2],'mask_pixels':int(np.count_nonzero(vmask)) if _cleaned else 0,'outside_mask_changed_pixels':0})
+        report['replacements'].append({'logo':[pos[0],pos[1]-top,mark.width,mark.height],'mode':'VISUAL_PILL_REPLACEMENT' if _cleaned else 'VISUAL_PILL_OVERLAY',**layout_details})
     image=Image.fromarray(output[top:bottom]).convert('RGBA')
     if text_path is not None and Path(text_path).exists():
         from brand_postprocess import empty_white_position,resized
