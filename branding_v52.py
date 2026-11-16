@@ -420,6 +420,54 @@ def eva_pill_mask(reference,group):
     return mask,bounds
 
 
+def eva_graphic_pill_regions(reference):
+    """Detect EvaScans' graphic pill directly from the artwork.
+
+    The mid-chapter EVASCANS.NET pill is a hot-pink-bordered black capsule
+    with a pink emblem; OCR never yields a region for it, so the group-based
+    replacement is blind to it and the mark survived branding (operator:
+    "masih ada beberapa yang kelewat", 2026-11-16). This restores the
+    detector of the 2026-11-12 VISUAL_PILL_OVERLAY branch, which the
+    2026-11-16 reset to the pristine repo had removed. The pink signature is
+    deliberately strict (measured on a real pill: H 158-169, S/V >= 151) so
+    artwork pinks and other groups' purple pills never qualify. Returns
+    synthetic region dicts shaped like OCR regions."""
+    h,w=reference.shape[:2]
+    hsv=cv2.cvtColor(reference,cv2.COLOR_RGB2HSV)
+    pink=((hsv[:,:,0]>=148)&(hsv[:,:,0]<=175)&(hsv[:,:,1]>150)&(hsv[:,:,2]>150)).astype(np.uint8)
+    if int(pink.sum())<1200:return []
+    kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(9,5))
+    merged=cv2.morphologyEx(pink,cv2.MORPH_CLOSE,kernel)
+    count,labels,stats,_=cv2.connectedComponentsWithStats(merged,8)
+    dark=reference.max(axis=2)<60
+    boxes=[]
+    for i in range(1,count):
+        x,y,bw,bh,area=(int(v) for v in stats[i])
+        if area<200:continue
+        boxes.append([x,y,x+bw,y+bh,int(pink[y:y+bh,x:x+bw].sum())])
+    # Merge nearby fragments: the emblem and the capsule border of one pill
+    # can arrive as separate components.
+    changed=True
+    while changed:
+        changed=False
+        for i in range(len(boxes)):
+            for j in range(i+1,len(boxes)):
+                a,b=boxes[i],boxes[j]
+                if a[0]-45<=b[2] and b[0]-45<=a[2] and a[1]-45<=b[3] and b[1]-45<=a[3]:
+                    boxes[i]=[min(a[0],b[0]),min(a[1],b[1]),max(a[2],b[2]),max(a[3],b[3]),a[4]+b[4]]
+                    del boxes[j];changed=True;break
+            if changed:break
+    found=[]
+    for x1,y1,x2,y2,pcount in boxes:
+        bw,bh=x2-x1,y2-y1
+        if not (w*.22<=bw<=w*.64 and w*.045<=bh<=w*.17 and bw>=2.1*bh):continue
+        if pcount<1200:continue
+        if float(pink[y1:y2,x1:x2].mean())<.07:continue
+        if float(dark[y1:y2,x1:x2].mean())<.28:continue
+        found.append({'id':f'visual-eva-pill-{len(found)+1}','text':'EVASCANS.NET',
+                      'bbox':{'x':x1,'y':y1,'width':bw,'height':bh}})
+    return found
+
 def dusk_pill_mask(reference, group):
     """Cover DuskScans' red portrait medallion and attached dark capsule."""
     h, w = reference.shape[:2]
@@ -676,6 +724,16 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
                 'reason':'Source mark intersects protected text; no cleanup or logo applied',
                 'mask_pixels':0,'outside_mask_changed_pixels':0})
             continue
+        # Clean the WHOLE source mark, not only its measured silhouette
+        # (operator request 2026-11-16): emblem edges, glows and badge parts
+        # outside the OCR/pill measurement survived the old repair and stayed
+        # visible next to the replacement logo. Dilate the mask before
+        # repairing; for pills erase the full capsule rectangle.
+        _k=max(5,round(w*.006))|1
+        mask=cv2.dilate(mask,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(_k,_k)))
+        if is_pill:
+            _bx1,_by1,_bx2,_by2=bounds
+            mask[max(0,_by1):min(h,_by2),max(0,_bx1):min(w,_bx2)]=255
         # Repair from RAW context, not remnants of the previous branding pass.
         try:
             repaired=inpaint(reference,mask)
@@ -733,6 +791,40 @@ def apply_branding_v52(image_path,ocr_path,logo_path,text_path,*,first_page=Fals
         inpaint=XianScanClient(os.getenv('XIANSCAN_URL','http://127.0.0.1:8123')).inpaint_mask
     output,emblem_decisions=clean_emblems(reference,output,protected,top,bottom,inpaint)
     report['decisions'].extend(emblem_decisions)
+    # VISUAL_PILL_OVERLAY (restored 2026-11-16): EvaScans' mid-chapter pill is
+    # pure artwork -- OCR yields no region for it, so the group loop above is
+    # blind to it. Detect it from the pixels and cover it with the brand logo
+    # directly: NO erase/inpaint (that left a visible blur block and the
+    # operator rejected it on 2026-11-12). Logo width = pill width (the
+    # operator's final sizing rule), capped at 62% of the page width, with
+    # the same protected-text collision guard as every other replacement.
+    handled=[d['context'] for d in report['decisions'] if d.get('action') in ('REPLACED_PILL','REMOVED_SOURCE_TEXT') and d.get('context')]
+    for vr in eva_graphic_pill_regions(reference):
+        b=vr['bbox'];x1,y1=int(b['x']),int(b['y']);x2,y2=x1+int(b['width']),y1+int(b['height'])
+        if y1<top or y2>bottom:continue
+        cx,cy=(x1+x2)//2,(y1+y2)//2
+        if any(hx1<=cx<=hx2 and hy1<=cy<=hy2 for hx1,hy1,hx2,hy2 in handled):continue
+        collision=None
+        for r in protected:
+            rb=r['bbox'];rx,ry=int(rb['x']),int(rb['y']);rw,rh=int(rb['width']),int(rb['height'])
+            if rx<x2 and rx+rw>x1 and ry<y2 and ry+rh>y1:collision=r;break
+        if collision is not None:
+            report['decisions'].append({'text':'EVASCANS.NET','action':'PRESERVED_PROTECTED_OVERLAP',
+                'context':[x1,y1,x2,y2],'protected_text':str(collision.get('text',collision.get('id'))),
+                'reason':'Visual pill intersects protected text; no overlay applied','mask_pixels':0,'outside_mask_changed_pixels':0})
+            continue
+        target=min(x2-x1,round(w*.62))
+        mark=logo.resize((target,max(1,round(logo.height*target/logo.width))),Image.Resampling.LANCZOS)
+        pos=(cx-mark.width//2,cy-mark.height//2)
+        mx,my=pos
+        sx1,sy1=max(0,mx),max(0,my);sx2,sy2=min(w,mx+mark.width),min(h,my+mark.height)
+        if sx2>sx1 and sy2>sy1:
+            patch=mark.crop((sx1-mx,sy1-my,(sx1-mx)+(sx2-sx1),(sy1-my)+(sy2-sy1)))
+            window=Image.fromarray(output[sy1:sy2,sx1:sx2]).convert('RGBA')
+            window.alpha_composite(patch,(0,0))
+            output[sy1:sy2,sx1:sx2]=np.array(window.convert('RGB'))
+        report['decisions'].append({'text':'EVASCANS.NET','action':'REPLACED_VISUAL_PILL','context':[x1,y1,x2,y2],'mask_pixels':0,'outside_mask_changed_pixels':0})
+        report['replacements'].append({'logo':[pos[0],pos[1]-top,mark.width,mark.height],'mode':'VISUAL_PILL_OVERLAY'})
     image=Image.fromarray(output[top:bottom]).convert('RGBA')
     if text_path is not None and Path(text_path).exists():
         from brand_postprocess import empty_white_position,resized

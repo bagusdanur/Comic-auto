@@ -10,7 +10,8 @@ def fit_larger_logo(logo,bounds,source_mask,repaired,protected):
     h,w=repaired.shape[:2];x1,y1,x2,y2=bounds
     # Slightly stronger Ryukomik presence while retaining every existing
     # collision/border check below.
-    desired=min(round(w*.29),round((x2-x1)*.96))
+    # Operator request 2026-11-16: replacement logo a bit smaller.
+    desired=min(round(w*.25),round((x2-x1)*.88))
     # A modest local expansion, never a relocation to a random page corner.
     pad=max(8,round(w*.12))
     cx=(x1+x2)/2;cy=(y1+y2)/2
