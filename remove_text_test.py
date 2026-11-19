@@ -772,8 +772,14 @@ def main() -> int:
             source_regions = [by_id[r] for r in group["source_region_ids"] if r in by_id]
             if not source_regions:
                 raise RuntimeError(f"V5 missing source regions: {group['id']}")
-            from verified_flat_cleanup import verified_white_fill
+            from verified_flat_cleanup import verified_white_fill, verified_uniform_fill
             flat = verified_white_fill(original, source_regions, surface)
+            flat_backend = 'v5-verified-white-fill'
+            if flat is None:
+                # Balon off-white/bernoise/berwarna: fill solid warna interior
+                # (crisp) alih-alih jatuh ke LaMa inpaint yang blur.
+                flat = verified_uniform_fill(original, source_regions, surface)
+                flat_backend = 'v5-verified-uniform-fill'
             if flat is not None:
                 permitted, fill, verification = flat
                 # Putih hanya untuk hurufnya: tepi persegi footprint pernah
@@ -789,7 +795,7 @@ def main() -> int:
                 results.append({
                     'id': group['id'], 'status': 'CLEANED',
                     'surface_type': 'BUBBLE_FLAT',
-                    'removal_backend': 'v5-verified-white-fill',
+                    'removal_backend': flat_backend,
                     'inpaint_batches': 0, 'changed_pixels': int(np.count_nonzero(delta)),
                     'outside_mask_changed_pixels': 0, 'flat_verification': verification,
                 })
