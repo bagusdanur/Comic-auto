@@ -33,7 +33,14 @@ def source_promo_page(ocr: dict) -> bool:
          and 'READ' in compact and ('ONLYAT' in compact or 'READONLY' in compact)
          and 'SUPPORT' in compact
          and ('REACHOUT' in compact or 'DISCORD' in compact))
-    return bool(madara or eva)
+    # MGREAD promo cards: require both the vendor and independent advertising
+    # evidence, plus card geometry. Never classify a tall mixed story page.
+    mgread = (width > 0 and width * .75 <= height <= width * 1.8
+              and bool(re.search(r'M[G6]READ', compact))
+              and 'FASTESTUPDATES' in compact
+              and ('NEWCOMIC' in compact or 'NEWANIME' in compact)
+              and ('#ACTION' in compact or '#ADVENTURE' in compact or '#DRAMA' in compact))
+    return bool(madara or eva or mgread)
 
 
 def hybrid_artwork_eligible(source_credit: bool, surface: dict | None,
@@ -169,7 +176,14 @@ def flat_glyph_fill_mask(image: np.ndarray, permitted: np.ndarray,
             continue
         _, (rect_w, rect_h), _ = cv2.minAreaRect(points)
         long_side, short_side = max(rect_w, rect_h), max(1.0, min(rect_w, rect_h))
-        if long_side / short_side > 3.0 or short_side > line_height * 1.1:
+        ratio = long_side / short_side
+        # Busur bubble itu panjang-dan-tipis. Pecahan huruf (apostrof 10x12,
+        # batang huruf 13x27) juga tipis, tapi pendek -- dulu ikut ditolak oleh
+        # batas rasio 3.0 sehingga tertinggal sebagai garis hitam di balon
+        # (Pyscho ch2 page-008 bubble-001: apostrof + 3 batang). Batas rasio
+        # hanya berlaku untuk komponen yang benar-benar panjang.
+        line_like = ratio > 3.0 and long_side >= max(40, round(line_height * 1.2))
+        if line_like or short_side > line_height * 1.1:
             continue
         glyphs[labels == index] = 255
     if not np.any(glyphs):
@@ -252,6 +266,47 @@ def inpaint_glyph_mask(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     result = image.copy()
     selected = local_mask > 0
     result[y1:y2, x1:x2][selected] = candidate[selected]
+    return result
+
+
+def fill_mask_rowwise(image: np.ndarray, mask: np.ndarray, feather: int = 2) -> np.ndarray:
+    """Isi sisa tinta dengan warna latar per baris, lalu feather tepinya.
+
+    `cv2.inpaint` menarik warna tetangga terdekat dan pada gradien gelap
+    meninggalkan noda (pyscho ch3 page-001: bekas "ME" jadi smudge). Median
+    per baris mengikuti gradien vertikal balon, jadi tambalannya menyatu dan
+    tepinya tidak terlihat sebagai kotak.
+    """
+    if mask is None or not mask.any():
+        return image
+    points = cv2.findNonZero(mask)
+    if points is None:
+        return image
+    x, y, w, h = cv2.boundingRect(points)
+    result = image.copy()
+    last_color = None
+    # Ambil warna latar dari jendela yang lebih lebar dari bbox, karena di
+    # dalam bbox satu baris bisa tertutup mask seluruhnya.
+    pad = max(12, min(40, max(w, h)))
+    wx0, wx1 = max(0, x - pad), min(image.shape[1], x + w + pad)
+    for row in range(y, y + h):
+        row_mask = mask[row, wx0:wx1] > 0
+        if not row_mask.any():
+            continue
+        outside = image[row, wx0:wx1][~row_mask]
+        if outside.size >= 3:
+            last_color = np.median(outside.reshape(-1, 3), axis=0)
+        if last_color is None:
+            continue
+        columns = np.nonzero(row_mask)[0] + wx0
+        result[row, columns] = last_color
+    if feather > 0:
+        core = (mask > 0).astype(np.float32)
+        soft = cv2.GaussianBlur(core, (0, 0), feather)
+        # inti mask harus tetap 1 supaya piksel sisa benar-benar tertutup;
+        # hanya tepinya yang lunak.
+        alpha = np.clip(np.maximum(core, soft * 1.6), 0, 1)[..., None]
+        result = (result.astype(np.float32) * alpha + image.astype(np.float32) * (1 - alpha)).round().astype(image.dtype)
     return result
 
 
@@ -514,6 +569,136 @@ def tied_to_erased(region, grouped_ids, by_id, min_area=400, min_height=12):
     return False
 
 
+def sweep_residue_fragments(original: np.ndarray, output: np.ndarray, results: list[dict],
+                            group_boxes: dict, allowed_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    """Bersihkan pecahan tinta kecil yang lolos dari mask.
+
+    Mask footprint dan white-fill hanya menutup komponen huruf yang lolos
+    filternya; apostrof dan batang sempit sering tertinggal sebagai garis
+    hitam di balon (pyscho ch2 page-008 bubble-001, page-007 bubble-009).
+    Sweep ini hanya menyentuh piksel yang (a) masih persis seperti aslinya,
+    (b) gelap di aslinya, (c) berada di dalam bbox grup yang sudah dinyatakan
+    CLEANED/INPAINTED, dan (d) komponennya kecil serta tidak menempel tepi
+    crop -- jadi busur balon dan artwork di luar area teks tidak tersentuh.
+    """
+    cleaned = 0
+    by_id = {item.get("id"): item for item in results}
+    for gid, box in group_boxes.items():
+        item = by_id.get(gid)
+        if not item or item.get("status") not in ("CLEANED", "INPAINTED"):
+            continue
+        if not box:
+            continue
+        pad = 8
+        x, y, w, h = (int(box[key]) for key in ("x", "y", "width", "height"))
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(original.shape[1], x + w + pad), min(original.shape[0], y + h + pad)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        src = original[y0:y1, x0:x1]
+        dst = output[y0:y1, x0:x1]
+        unchanged = np.abs(src.astype(np.int16) - dst.astype(np.int16)).max(axis=2) < 10
+        dark_ink = (src.min(axis=2) < 100) & (dst.min(axis=2) < 100)
+        # Residue BERWARNA (biru/hijau/abu teks sumber) lolos dari gerbang gelap
+        # karena min channel >= 100. Deteksi juga tinta yang kontras terhadap
+        # latar bersih setempat supaya ghosting berwarna ikut tersapu. Guard
+        # komponen kecil + tidak menempel tepi crop tetap melindungi artwork.
+        background = np.median(dst.reshape(-1, 3), axis=0)
+        color_dist = np.abs(src.astype(np.int16) - background.astype(np.int16)).max(axis=2)
+        colored_ink = (color_dist > 55) & (dst.min(axis=2) >= 100)
+        ink = (dark_ink | colored_ink) & unchanged
+        if not ink.any():
+            continue
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+        local = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        for index in range(1, count):
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            if area < 12 or area > 600:
+                continue
+            left = int(stats[index, cv2.CC_STAT_LEFT]); top = int(stats[index, cv2.CC_STAT_TOP])
+            cw = int(stats[index, cv2.CC_STAT_WIDTH]); ch = int(stats[index, cv2.CC_STAT_HEIGHT])
+            if max(cw, ch) > 60:
+                continue
+            if left <= 0 or top <= 0 or left + cw >= local.shape[1] or top + ch >= local.shape[0]:
+                continue
+            local[labels == index] = 255
+        if not local.any():
+            continue
+        local = cv2.dilate(local, np.ones((3, 3), np.uint8), iterations=1)
+        before = output.copy()
+        padded = np.pad(local, ((y0, original.shape[0] - y1), (x0, original.shape[1] - x1)))
+        output = fill_mask_rowwise(output, padded)
+        delta = np.any(output != before, axis=2)
+        allowed_mask |= np.where(delta, 255, 0).astype(np.uint8)
+        pixels = int(np.count_nonzero(delta))
+        if pixels:
+            item["residue_pixels"] = int(item.get("residue_pixels", 0)) + pixels
+            cleaned += pixels
+    return output, allowed_mask, cleaned
+
+
+def sweep_panel_edge_leftovers(original: np.ndarray, output: np.ndarray, results: list[dict],
+                               group_boxes: dict, allowed_mask: np.ndarray,
+                               below: int = 140) -> tuple[np.ndarray, np.ndarray, int]:
+    """Bersihkan sisa huruf yang terpotong tepi panel di bawah teks grup.
+
+    Baris terakhir sebuah balon kadang terpotong tepi panel sehingga OCR tidak
+    pernah mendeteksinya ("...PRECIOUS TO" / "ME" di pyscho ch3 page-001
+    bubble-007). Piksel itu tidak dimiliki grup mana pun, jadi mask cleaning
+    tidak menyentuhnya dan tampil sebagai gumpalan putih.
+    Pita pencarian sengaja hanya DI BAWAH bbox grup dengan lebar bbox + 10 px,
+    supaya tidak pernah menyentuh artwork lain di halaman.
+    """
+    cleaned = 0
+    by_id = {item.get("id"): item for item in results}
+    height, width = original.shape[:2]
+    for gid, box in group_boxes.items():
+        item = by_id.get(gid)
+        if not item or item.get("status") not in ("CLEANED", "INPAINTED") or not box:
+            continue
+        x, y, w, h = (int(box[key]) for key in ("x", "y", "width", "height"))
+        x0, x1 = max(0, x - 10), min(width, x + w + 10)
+        y0, y1 = max(0, y + h - 6), min(height, y + h + below)
+        if x1 - x0 < 12 or y1 - y0 < 12:
+            continue
+        src = original[y0:y1, x0:x1]
+        dst = output[y0:y1, x0:x1]
+        unchanged = np.abs(src.astype(np.int16) - dst.astype(np.int16)).max(axis=2) < 10
+        background = float(np.median(dst.mean(axis=2)))
+        if background > 140:
+            # Huruf gelap di bawah teks tidak dibedakan dari garis artwork;
+            # kasus yang terbukti butuh sweep ini adalah huruf terang.
+            continue
+        ink = unchanged & (src.mean(axis=2) > background + 55) & (src.min(axis=2) > 150)
+        if not ink.any():
+            continue
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+        picked = np.zeros(ink.shape, np.uint8)
+        for index in range(1, count):
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            if area < 15 or area > 800:
+                continue
+            if max(int(stats[index, cv2.CC_STAT_WIDTH]), int(stats[index, cv2.CC_STAT_HEIGHT])) > 90:
+                continue
+            picked[labels == index] = 255
+        if not picked.any():
+            continue
+        # Dilasi lebih lebar supaya halo gelap anti-alias di tepi huruf ikut
+        # tertutup (kalau tidak, tertinggal bayangan berbentuk huruf).
+        picked = cv2.dilate(picked, np.ones((9, 9), np.uint8), iterations=1)
+        mask = np.zeros((height, width), np.uint8)
+        mask[y0:y1, x0:x1] = picked
+        before = output.copy()
+        output = fill_mask_rowwise(output, mask)
+        delta = np.any(output != before, axis=2)
+        allowed_mask |= np.where(delta, 255, 0).astype(np.uint8)
+        pixels = int(np.count_nonzero(delta))
+        if pixels:
+            item["edge_residue_pixels"] = int(item.get("edge_residue_pixels", 0)) + pixels
+            cleaned += pixels
+    return output, allowed_mask, cleaned
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", type=Path)
@@ -576,7 +761,8 @@ def main() -> int:
         if args.strict_artwork_inpaint and source_credit:
             # Raw branding is handled exclusively by the conservative branding
             # stage, never by a dialogue-cleaning fallback with broader masks.
-            results.append({'id':group['id'],'status':'PRESERVED','reason':'DEFER_SOURCE_BRANDING'})
+            results.append({'id':group['id'],'status':'PRESERVED','reason':
+                            'CONFIRMED_SOURCE_PROMOTION' if whole_page_source_promo else 'DEFER_SOURCE_BRANDING'})
             continue
         if args.strict_artwork_inpaint and not source_credit:
             if not surface:
@@ -655,7 +841,54 @@ def main() -> int:
             # pack those boxes into bounded requests instead of weakening the
             # sidecar limit or aborting the entire chapter.
             from footprint_masks import source_footprint_batches
-            batches = source_footprint_batches(original.shape, source_regions)
+            if (surface or {}).get('surface_type') not in ('BUBBLE_FLAT', 'BUBBLE_COLORED'):
+                # Teks menempel di atas gambar: kotak OCR penuh akan menghapus
+                # karakter/properti di bawah huruf. Pakai inti glyph saja.
+                glyph_mask = np.zeros(original.shape[:2], np.uint8)
+                for region in source_regions:
+                    piece, _ = artwork_text_mask(original, region['bbox'])
+                    if piece is not None:
+                        glyph_mask = cv2.bitwise_or(glyph_mask, piece)
+                if np.any(glyph_mask):
+                    # Kalau masker tetap menutupi hampir seluruh kotak OCR,
+                    # deteksi tinta gagal memisahkan huruf dari gambar di
+                    # bawahnya. Menghapusnya berarti merusak artwork.
+                    region_area = sum(int(r['bbox']['width']) * int(r['bbox']['height'])
+                                      for r in source_regions) or 1
+                    dense_share = float((glyph_mask > 0).sum()) / region_area
+                    header = group.get('text') or ''
+                    words = header.replace('\n', ' ').split()
+                    alnum = [ch for ch in header if ch.isalnum()]
+                    # Hanya SFX/nama tempat (huruf non-Latin, sangat pendek,
+                    # atau 1-2 kata) yang boleh dibiarkan. Dialog tetap harus
+                    # diterjemahkan walau tintanya menempel di artwork.
+                    # Hanya SFX satu kata (WOW., UGH!, SCRATCH) atau huruf
+                    # non-Latin. Kalimat pendek seperti "THAT'S IT?" atau
+                    # "M-MY ARM?!" tetap dialog dan wajib diterjemahkan.
+                    group_style = str(group.get('style') or '').lower()
+                    sfx_like = group_style == 'sfx' and (
+                        bool(re.search(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]', header))
+                        or (len(words) == 1 and len(alnum) <= 14))
+                    if dense_share > 0.55 and sfx_like:
+                        results.append({"id": group["id"], "status": "PRESERVED",
+                                        "surface_type": surface.get('surface_type'),
+                                        "reason": "ARTWORK_MASK_TOO_DENSE"})
+                        continue
+                    if dense_share > 0.55:
+                        # Dialog di atas gambar: mask inti glyph tidak bisa
+                        # memisahkan huruf dari artwork, jadi mundur ke kotak
+                        # baris OCR supaya teks tetap terhapus & diterjemahkan.
+                        glyph_mask = np.zeros(original.shape[:2], np.uint8)
+                        for batch in source_footprint_batches(original.shape, source_regions):
+                            glyph_mask = cv2.bitwise_or(glyph_mask, batch)
+                    else:
+                        # Inti glyph saja meninggalkan sisa tepi anti-alias; dilasi
+                        # kecil menutupnya tanpa kembali ke kotak OCR penuh.
+                        glyph_mask = cv2.dilate(glyph_mask, np.ones((5, 5), np.uint8), iterations=2)
+                batches = ([glyph_mask] if np.any(glyph_mask)
+                           else source_footprint_batches(original.shape, source_regions))
+            else:
+                batches = source_footprint_batches(original.shape, source_regions)
             batch_count = 0
             total_changed=0
             for permitted in batches:
@@ -1034,6 +1267,10 @@ def main() -> int:
     )
     orphan_regions = []
     for region in ocr.get("regions", []):
+        if whole_page_source_promo:
+            # Confirmed promo cards are preserved as a whole, including orphan
+            # glyphs. Do not route their ungrouped artwork through inpainting.
+            continue
         if region["id"] in grouped_region_ids:
             continue
         text = str(region.get("text", ""))
@@ -1088,6 +1325,12 @@ def main() -> int:
                 "source_texts": [str(r.get("text", ""))[:80] for r in orphan_regions],
             })
 
+    group_boxes = {item["id"]: item.get("bbox") for item in translations["groups"]}
+    output, allowed_mask, residue_pixels = sweep_residue_fragments(
+        original, output, results, group_boxes, allowed_mask)
+    output, allowed_mask, edge_residue_pixels = sweep_panel_edge_leftovers(
+        original, output, results, group_boxes, allowed_mask)
+
     changed = np.any(output != original, axis=2)
     outside_changes = int(np.count_nonzero(changed & (allowed_mask == 0)))
     if outside_changes:
@@ -1108,6 +1351,8 @@ def main() -> int:
         "output_dimensions": [output.shape[1], output.shape[0]],
         "seconds": round(time.perf_counter() - started, 2),
         "changed_pixels": int(np.count_nonzero(changed)),
+        "residue_pixels": residue_pixels,
+        "edge_residue_pixels": edge_residue_pixels,
         "allowed_mask_pixels": int(np.count_nonzero(allowed_mask)),
         "outside_mask_changed_pixels": outside_changes,
         "results": results,

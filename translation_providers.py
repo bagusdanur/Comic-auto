@@ -320,9 +320,8 @@ class NineRouterProvider(TranslationProvider):
             item.strip() for item in os.getenv(
                 "NINEROUTER_FALLBACK_MODELS",
                 (
-                    "ag/claude-sonnet-4-6,"
-                    "glm/GLM-5.3-Flash,"
-                    "glm/glm-4.7"
+                    "ag/gemini-3-flash,"
+                    "ag/claude-sonnet-5-5-medium"
                 ),
             ).split(",") if item.strip() and item.strip() != self.model
         ]
@@ -335,7 +334,7 @@ class NineRouterProvider(TranslationProvider):
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        timeout = float(os.getenv("NINEROUTER_TIMEOUT_SECONDS", "60"))
+        timeout = float(os.getenv("NINEROUTER_TIMEOUT_SECONDS", "30"))
         async with httpx.AsyncClient(timeout=timeout) as client:
             last_error: Exception | None = None
             for model in [self.model, *self.fallback_models]:
@@ -350,6 +349,10 @@ class NineRouterProvider(TranslationProvider):
                                 ],
                                 "response_format": {"type": "json_object"},
                                 "temperature": 0.2,
+                                # Gateway 9router default-nya membalas SSE streaming
+                                # bila param stream tidak dikirim; body "data: {...}"
+                                # membuat json.loads gagal. Minta non-streaming eksplisit.
+                                "stream": False,
                     }
                     response = await asyncio.wait_for(
                         client.post(
@@ -366,8 +369,7 @@ class NineRouterProvider(TranslationProvider):
                     else:
                         response.raise_for_status()
                     is_sse = (
-                        "text/event-stream" in response.headers.get("content-type", "")
-                        and any(line.startswith("data: ") for line in response.text.splitlines())
+                        any(line.startswith("data: ") for line in response.text.splitlines())
                     )
                     if is_sse:
                         chunks: list[str] = []
@@ -398,8 +400,7 @@ class NineRouterProvider(TranslationProvider):
                         )
                         response.raise_for_status()
                         is_sse = (
-                            "text/event-stream" in response.headers.get("content-type", "")
-                            and any(line.startswith("data: ") for line in response.text.splitlines())
+                            any(line.startswith("data: ") for line in response.text.splitlines())
                         )
                         if is_sse:
                             chunks = []
