@@ -78,15 +78,124 @@ def persist_results(database, job: dict, pipeline_dir: Path, output_path: Path, 
     database.execute('UPDATE images SET region_count=(SELECT count(*) FROM regions WHERE image_id=?) WHERE id=?',(image_id,image_id))
 
 
+def process_clean_only(database, job: dict, root: Path) -> None:
+    """Mode "clean only": komik sudah diterjemahkan, hapus logo scanlator lalu
+    tempel branding Ryukomik. Tidak ada OCR translasi maupun typeset."""
+    job_root = Path(job["input_path"]).parent.parent
+    options = job.get("options") or {}
+    source_dir = job_root / "original"
+    out_dir = job_root / "output" / "clean"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    archive = Path(job["output_path"])
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    report = job_root / "output" / "clean-report.json"
+    command = [sys.executable, str(root / "tools/branding/clean_marks.py"), str(source_dir),
+               "--output", str(out_dir), "--report", str(report)]
+    if options.get("erase_only"):
+        command.append("--erase-only")
+    if options.get("crop_only"):
+        # Tanpa pembersihan: cukup salin halaman, potong, lalu tempel logo.
+        shutil.rmtree(out_dir, ignore_errors=True)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for image in sorted(source_dir.iterdir()):
+            if image.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp", ".avif"}:
+                shutil.copy2(image, out_dir / f"{image.stem}-clean.png")
+    print("CLEAN_ONLY:", " ".join(command), flush=True)
+    database.execute("UPDATE jobs SET stage='CLEANING',progress=0.05,updated_at=? WHERE id=?",
+                     (time.time(), job["id"]))
+    database.commit()
+    result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"clean-only gagal: {result.stderr[-500:]}")
+    pages = sorted(out_dir.glob("*-clean.png"))
+    if not pages:
+        raise RuntimeError("clean-only tidak menghasilkan halaman")
+    # Branding Ryukomik juga otomatis untuk mode clean-only.
+    from logo_stamp import stamp_logo
+    crop_top = max(0, int(options.get("crop_top") or 0))
+    crop_bottom = max(0, int(options.get("crop_bottom") or 0))
+    for page in pages:
+        cut_start = int(options.get("cut_start") or 0)
+        cut_end = int(options.get("cut_end") or 0)
+        if crop_top or crop_bottom or (cut_end > cut_start > 0):
+            with Image.open(page) as opened:
+                width, height = opened.size
+                top = min(crop_top, max(0, height - 1))
+                bottom = min(crop_bottom, max(0, height - top - 1))
+                image = opened.convert("RGB")
+                if cut_end > cut_start > 0:
+                    # Buang pita di tengah (mis. banner vendor).
+                    a = min(cut_start, height)
+                    b = min(cut_end, height)
+                    if b > a:
+                        image = Image.fromarray(__import__("numpy").vstack([
+                            __import__("numpy").array(image)[:a],
+                            __import__("numpy").array(image)[b:],
+                        ]))
+                if bottom > 0 or top > 0:
+                    image = image.crop((0, top, width, image.height - bottom))
+                image.save(page, format="PNG")
+        stamp_logo(page)
+    archive_webp(pages, archive)
+    database.execute("DELETE FROM images WHERE job_id=?", (job["id"],))
+    for index, page in enumerate(pages):
+        with Image.open(page) as opened:
+            width, height = opened.size
+        # Simpan sebelum/sesudah agar dashboard bisa menampilkan preview
+        # "sebelum" seperti review biasa (tanpa menyimpan dua kali di output).
+        metadata_dir = job_root / "metadata" / f"page-{index + 1:03d}"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(page, metadata_dir / "typeset.png")
+        stem = page.name.replace("-clean.png", "")
+        for candidate in (job_root / "original").glob(f"{stem}.*"):
+            shutil.copy2(candidate, metadata_dir / "original.png")
+            break
+        shutil.copy2(page, metadata_dir / "cleaned.png")
+        database.execute(
+            "INSERT INTO images(id,job_id,filename,width,height,status,output_path,metadata_path,region_count)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), job["id"], page.name.replace("-clean", ""), width, height,
+             "COMPLETED", str(page), str(metadata_dir), 0),
+        )
+    now = time.time()
+    database.execute(
+        "UPDATE jobs SET status='COMPLETED',stage='DONE',progress=1,review_count=0,error=NULL,"
+        "updated_at=?,completed_at=?,heartbeat_at=NULL WHERE id=?",
+        (now, now, job["id"]),
+    )
+    database.commit()
+
+
 def process_job(database, job: dict, root: Path, *, resume: bool = False) -> None:
+    if job["options"].get("clean_only"):
+        # Tidak ada OCR/translasi: jangan buang RAM untuk service OCR.
+        _process_job(database, job, root, resume=resume, ocr_service=None)
+        return
+    from resident_ocr import chapter_ocr
+    files=job['options'].get('input_files') or [job['input_path']]
+    enabled=len(files)>1 and os.getenv('TRANSLATOR_OCR_RESIDENT','1')=='1'
+    with chapter_ocr(root,enabled) as service:
+        return _process_job(database,job,root,resume=resume,ocr_service=service)
+
+
+def _process_job(database, job: dict, root: Path, *, resume: bool = False, ocr_service=None) -> None:
     options = job["options"]
+    if options.get("clean_only"):
+        process_clean_only(database, job, root)
+        return
     job_root = Path(job["input_path"]).parent.parent
     filenames = options.get("input_files") or [Path(job["input_path"]).name]
     original_names = options.get("original_names") or []
     input_paths=[job_root/'original'/name for name in filenames]
     from priority_seams import PRIORITY_SLUG,prepare_inputs
-    if options.get('title_slug')==PRIORITY_SLUG and options.get('pipeline_engine')=='v5':
+    if options.get('title_slug')==PRIORITY_SLUG and options.get('pipeline_engine')=='v5' and options.get('raw_input_mode') not in ('original','joined'):
         input_paths=prepare_inputs(input_paths,job_root/'prepared-seams-v1')
+    from raw_join import TITLE_SLUG, prepare_inputs as join_inputs
+    if options.get('title_slug') == TITLE_SLUG and options.get('pipeline_engine') == 'v5' and options.get('raw_input_mode') not in ('original','joined'):
+        # Completed page caches retain their original coordinate system.
+        if (job_root/'prepared-joined-v1/manifest.json').exists() or not resume or not any((job_root/'metadata').glob('page-*/pipeline-status.json')):
+            input_paths=join_inputs(input_paths,job_root/'prepared-joined-v1')
+            filenames=[p.name for p in input_paths]
     outputs: list[Path] = []
     review_count = 0
     if not resume:
@@ -123,6 +232,8 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
             "--env-file", options.get("env_file", ".env.9router"),
             "--min-y", str(options.get("min_y", 0)), "--job-dir", str(pipeline_dir),
             "--memory", str(root / "data" / "memory" / f"{options.get('title_slug') or 'legacy'}.json"),
+            "--chapter-context", str(job_root / "chapter-context.json"),
+            "--chapter", str(options.get('chapter') or ''),
             "--quality-v2", options.get("quality_v2") or os.getenv("QUALITY_PIPELINE_V2", "on"),
             "--hybrid-mode", options.get("hybrid_mode") or os.getenv("HYBRID_PIPELINE", "off"),
             "--lama-model", options.get("lama_model") or os.getenv("LAMA_MODEL_PATH", "models/lama.onnx"),
@@ -138,6 +249,13 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
         # cancellation/result handling while resuming only its branding step.
         run_command=command if cached_pipeline is None else [sys.executable,'-c','pass']
         child_env = os.environ.copy()
+        child_env.pop('TRANSLATOR_OCR_SOCKET',None)
+        child_env.pop('TRANSLATOR_OCR_PID',None)
+        child_env.pop('TRANSLATOR_OCR_OWNER_PID',None)
+        if ocr_service:
+            child_env['TRANSLATOR_OCR_SOCKET']=str(ocr_service[0])
+            child_env['TRANSLATOR_OCR_PID']=str(ocr_service[1])
+            child_env['TRANSLATOR_OCR_OWNER_PID']=str(os.getpid())
         configured_model = setting(database, "ninerouter_model", "").strip()
         configured_fallbacks = setting(database, "ninerouter_fallback_models", "").strip()
         if configured_model:
@@ -216,6 +334,7 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
         pipeline = json.loads((pipeline_dir / "pipeline-status.json").read_text(encoding="utf-8"))
         review_count += len(pipeline.get("review_ids", []))
         if batch and bool(options.get("branding_enabled", True)):
+            branding_started = time.perf_counter()
             branding_report = apply_branding(
                 output_path,
                 pipeline_dir / "ocr-result.json",
@@ -224,6 +343,15 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
                 first_page=index == 0,
                 banner_path=(root / "assets" / "branding" / "banner.png")
                 if index == len(filenames) - 1 else None,
+            )
+            # Branding previously ran outside translate.py, so its cost (often
+            # ~16% of a page) never appeared in durations and the dashboard
+            # could not show the real bottleneck. Record it like other stages.
+            pipeline.setdefault("durations", {})["BRANDING"] = round(
+                time.perf_counter() - branding_started, 2
+            )
+            (pipeline_dir / "pipeline-status.json").write_text(
+                json.dumps(pipeline, indent=2), encoding="utf-8"
             )
             (pipeline_dir / "branding-report.json").write_text(
                 json.dumps(branding_report, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -235,6 +363,13 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
             )
         display_name = original_names[index] if len(original_names) == len(filenames) else filename
         persist_results(database, job, pipeline_dir, output_path, display_name, pipeline["status"])
+        try:
+            # Simpan dialog halaman ini sebagai konteks halaman berikutnya.
+            from chapter_context import update as update_chapter_context
+            groups = json.loads((pipeline_dir / "translations.json").read_text(encoding="utf-8")).get("groups", [])
+            update_chapter_context(job_root / "chapter-context.json", index + 1, groups)
+        except Exception as error:  # konteks tidak boleh menggagalkan chapter
+            print("chapter-context gagal:", error, flush=True)
         outputs.append(output_path)
         database.commit()
 
@@ -253,7 +388,67 @@ def process_job(database, job: dict, root: Path, *, resume: bool = False) -> Non
         (final_status, review_count, now, now, job["id"]),
     )
     database.commit()
+    learn_chapter_addresses(job_root, options)
     prune_job_scratch(job_root)
+
+
+def learn_chapter_addresses(job_root: Path, options: dict) -> None:
+    """Simpan sapaan yang sudah mapan ke memori judul.
+
+    Job berikutnya (chapter lain) langsung memakai bentuk yang sama tanpa
+    menunggu halaman pertama menentukan sendiri.
+
+    Dua pengaman supaya gender tidak pernah salah terkunci:
+    1. Hanya nama diri sungguhan (gelar/kata sifat seperti "Guru"/"Muda"/"Tua"
+       dilewati) — lihat chapter_context.iter_address.
+    2. Honorifik bergender hanya dipelajari bila teks sumber Inggris setuju
+       (he/his vs she/her). Tanpa bukti, atau bila bertentangan, tidak dikunci.
+    3. Bentuk yang sudah mapan TIDAK ditimpa. Dulu `names.update(changed)`
+       membalik gender tiap chapter berdasarkan kemunculan pertama, sehingga
+       karakter perempuan bisa terpanggil "Bapak" di chapter berikutnya.
+    """
+    slug = options.get("title_slug")
+    if not slug:
+        return
+    from chapter_context import iter_address
+    from language_memory import honorific_gender, source_gender
+    found: dict[str, str] = {}
+    for page in sorted(job_root.glob("metadata/page-*/translations.json")):
+        try:
+            groups = json.loads(page.read_text(encoding="utf-8")).get("groups", [])
+        except (OSError, ValueError):
+            continue
+        for group in groups:
+            translation = str(group.get("translation") or "")
+            source = str(group.get("text") or "")
+            for honorific, name in iter_address(translation):
+                gender = honorific_gender(honorific)
+                if gender != "neutral":
+                    evidence = source_gender(source)
+                    # Kunci hanya bila sumber menegaskan gender yang sama.
+                    if evidence is None or evidence != gender:
+                        continue
+                found.setdefault(name, f"{honorific} {name}")
+    if not found:
+        return
+    policy_path = Path(__file__).resolve().parent / "data" / "memory" / slug / "editorial-policy.json"
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
+    except ValueError:
+        policy = {}
+    names = policy.get("address_names") or {}
+    if not isinstance(names, dict):
+        names = {}
+    # Jangan timpa yang sudah mapan; koreksi bentuk lama lewat editorial-policy
+    # `address` (operator), bukan lewat tebakan chapter baru.
+    changed = {name: form for name, form in found.items() if name not in names}
+    if not changed:
+        return
+    names.update(changed)
+    policy["address_names"] = names
+    policy_path.write_text(json.dumps(policy, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("learned addresses:", changed, flush=True)
 
 
 def prune_job_scratch(job_root: Path) -> None:

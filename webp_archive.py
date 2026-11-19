@@ -11,7 +11,29 @@ from PIL import Image
 MAX_CONVERT_HEIGHT = 16000
 SPLIT_HEIGHT = 12000
 WEBP_QUALITY = 100
-WEBP_METHOD = 6
+# method=4: 2,5x lebih cepat dari method=6 dengan selisih ukuran hanya ~1,2%
+# (terukur pada halaman nyata 720x15000: 2,10s vs 5,29s; 2,47MB vs 2,44MB).
+# method=2 lebih cepat lagi tapi ukuran +41%, jadi tidak dipakai.
+WEBP_METHOD = 4
+
+
+def name_suffix() -> str:
+    """Akhiran nama file WebP dari env `WEBP_NAME_SUFFIX`.
+
+    Dipakai untuk membedakan hasil render baru dari file lama yang sudah
+    ter-cache di pembaca (mis. `001_001-v2.webp`). Kosong = perilaku lama.
+    """
+    raw = os.environ.get("WEBP_NAME_SUFFIX", "").strip()
+    if not raw:
+        return ""
+    return raw if raw.startswith(("-", "_")) else "-" + raw
+
+
+def member_name(stem: str, part: int | None = None) -> str:
+    suffix = name_suffix()
+    if part is None:
+        return f"{stem}{suffix}.webp"
+    return f"{stem}{suffix}_part{part:02d}.webp"
 
 
 def _webp_bytes(image: Image.Image, quality: int) -> bytes:
@@ -46,12 +68,12 @@ def page_webp_members(
         stem = source.stem
         page = crop_page(opened, crop_top, crop_bottom)
         if page.height <= MAX_CONVERT_HEIGHT:
-            return [(f"{stem}.webp", _webp_bytes(page, quality))]
+            return [(member_name(stem), _webp_bytes(page, quality))]
         members: list[tuple[str, bytes]] = []
         part = 1
         for y in range(0, page.height, SPLIT_HEIGHT):
             chunk = page.crop((0, y, page.width, min(page.height, y + SPLIT_HEIGHT)))
-            members.append((f"{stem}_part{part:02d}.webp", _webp_bytes(chunk, quality)))
+            members.append((member_name(stem, part), _webp_bytes(chunk, quality)))
             part += 1
         return members
 
@@ -99,13 +121,13 @@ def archive_webp(
                     top, bottom = crops.get(source.name, (0, 0))
                     page = crop_page(opened, top, bottom)
                     if page.height <= MAX_CONVERT_HEIGHT:
-                        archive.writestr(f"{stem}.webp", _webp_bytes(page, quality))
+                        archive.writestr(member_name(stem), _webp_bytes(page, quality))
                         count += 1
                         continue
                     part = 1
                     for y in range(0, page.height, SPLIT_HEIGHT):
                         chunk = page.crop((0, y, page.width, min(page.height, y + SPLIT_HEIGHT)))
-                        archive.writestr(f"{stem}_part{part:02d}.webp", _webp_bytes(chunk, quality))
+                        archive.writestr(member_name(stem, part), _webp_bytes(chunk, quality))
                         count += 1
                         part += 1
         os.replace(temporary, destination)
